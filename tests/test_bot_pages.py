@@ -745,6 +745,7 @@ class AnswerActionTests(unittest.TestCase):
             "https://changjiang.yuketang.cn/lesson/fullscreen/v3/123/ppt/8"
         )
         bot = make_bot()
+        bot.config.values["save_exercise_html"] = True
 
         with (
             patch("src.bot.os.makedirs"),

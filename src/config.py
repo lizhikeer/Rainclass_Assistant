@@ -63,6 +63,8 @@ DEFAULTS: dict[str, Any] = {
     "submit_delay": 1,
     "check_interval": 60,
     "quiz_refresh_interval": 1,
+    "classroom_poll_interval_ms": 200,  # 课堂内高频检测间隔（毫秒），优先于 quiz_refresh_interval
+    "save_exercise_html": False,  # 是否保存每题完整 HTML（默认关闭，诊断按需开启）
     "xxtui_api_key": "",
     "last_cookie_warn_date": "",
     "last_cookie_update_time": "",
@@ -183,7 +185,7 @@ class Config:
                 errors.append("mode 必须是 observe 或 auto")
 
         # 布尔字段类型
-        for key in ("headless_mode", "debug_mode", "auto_sign_in"):
+        for key in ("headless_mode", "debug_mode", "auto_sign_in", "save_exercise_html"):
             if key in settings and not isinstance(settings.get(key), bool):
                 errors.append(f"{key} 必须是布尔值（true/false）")
 
@@ -192,6 +194,7 @@ class Config:
             "submit_delay": (0, 300),
             "check_interval": (5, 3600),
             "quiz_refresh_interval": (1, 300),
+            "classroom_poll_interval_ms": (50, 5000),
             "multi_ai_timeout": (1, 300),
             "auto_truncate_seconds": (0, 3600),
         }

@@ -131,6 +131,10 @@ class Bot:
         self._waiting_for_class_logged = False
         self._home_refreshed_at = 0.0  # 首页最近一次刷新/导航的时刻（monotonic）
         self._last_tab_limit_warn = 0.0  # 标签页超限警告节流
+        self._request_generation: int = 0  # 题目请求代际号（切题/换题时递增）
+        self._answer_generation: int = 0  # 当前在途 AI 请求所绑定的代际号
+        self._last_processed_question_id: str = ""  # 最近处理的题目标识
+        self._last_ended_check_time = 0.0  # 跨标签页下课深度扫描节流时间戳
 
     def log(self, message: str) -> None:
         """统一日志输出（只 emit 一次）。
@@ -488,8 +492,10 @@ class Bot:
         """定位当前可见题目容器；未知页面结构时保守回退到页面。"""
         for selector in (
             'section[class*="slide__cmp"]',
+            '[class*="slide__cmp"]',
             '[data-question-id]',
             '[data-problem-id]',
+            '.quiz-content',
         ):
             try:
                 item = self._last_visible(page.locator(selector))
@@ -684,6 +690,22 @@ class Bot:
         if self.browser.refresh(home_page):
             self._home_refreshed_at = time.monotonic()
 
+    def _classroom_poll_interval(self) -> float:
+        """返回课堂内高频检测间隔（秒）。
+
+        优先读取毫秒配置 classroom_poll_interval_ms（范围 50~5000ms），
+        未指定时回退到旧字段 quiz_refresh_interval（秒）。
+        """
+        ms_val = self.config.get("classroom_poll_interval_ms")
+        if ms_val is not None:
+            try:
+                ms = int(ms_val)
+                if 50 <= ms <= 5000:
+                    return ms / 1000.0
+            except (ValueError, TypeError):
+                pass
+        return float(self._int_setting("quiz_refresh_interval", 1, 1, 300))
+
     def _run_classroom_loop(self, page: Page) -> None:
         """在课堂页面内循环签到/答题直到下课。"""
         self._waiting_for_class_logged = False
@@ -694,16 +716,25 @@ class Bot:
         invalid_checks = 0
 
         while not self.stop_event.is_set():
-            quiz_interval = self._int_setting("quiz_refresh_interval", 1, 1, 300)
+            poll_interval = self._classroom_poll_interval()
             try:
-                # 当前页可能是没有 timeline 的 exercise；必须扫描同 lesson 的
-                # PPT/入口页，才能及时收到老师结束课堂的消息。
-                if self._handle_class_ended(page):
-                    return
-
+                # 页面关闭即刻退出
                 if page.is_closed():
                     self.log("课堂标签页已关闭，返回课程发现流程。")
                     return
+
+                # 若当前页直接出现下课标记，立即处理
+                if self._has_class_ended_signal(page):
+                    if self._handle_class_ended(page):
+                        return
+
+                # 跨标签页下课深度扫描节流：仅在路由变化或间隔 >= 2.0 秒时执行
+                now = time.monotonic()
+                cur = page.url
+                if (cur != self._last_classroom_url) or (now - self._last_ended_check_time >= 2.0):
+                    self._last_ended_check_time = now
+                    if self._handle_class_ended(page):
+                        return
 
                 if not self._is_classroom_page(page):
                     replacement = self._find_classroom_in_pages(announce=False)
@@ -712,31 +743,42 @@ class Bot:
                         if invalid_checks >= 3:
                             self.log("课堂页面已失效，返回课程发现流程。")
                             return
-                        self.stop_event.wait(1)
+                        self.stop_event.wait(min(poll_interval, 1.0))
                         continue
                     page = replacement
                     self.browser.use_page(page)
+                    self._request_generation += 1
                 invalid_checks = 0
 
-                # 新题可能在提示点击后同页展示，也可能打开新标签页。
+                # 检查并处理新题提示
                 pages_before_prompt = tuple(self.browser.pages)
                 clicked_prompt = self._open_new_quiz(page)
                 new_page = None
                 if clicked_prompt:
-                    deadline = time.monotonic() + 3
+                    # 多条件等待：新标签页、同页切换、同页渲染题目、页面关闭均可即刻退出
+                    deadline = time.monotonic() + 3.0
                     while not self.stop_event.is_set() and time.monotonic() < deadline:
                         new_page = self._find_new_classroom_page(pages_before_prompt)
                         if new_page is not None:
                             break
-                        self.stop_event.wait(0.1)
+                        if page.is_closed():
+                            break
+                        if self._is_exercise_page(page) or self._has_answerable_options(page):
+                            self._last_quiz_detected_time = time.monotonic()
+                            self._last_quiz_detection_source = "prompt_same_page"
+                            break
+                        self.stop_event.wait(0.04)
+
                 if new_page is not None:
                     page = new_page
                     self.browser.use_page(page)
+                    self._request_generation += 1
                     self.log(f"已跟随到新的课堂标签页：{page.url[:100]}")
 
                 cur = page.url
                 if cur and cur != self._last_classroom_url:
                     self._last_classroom_url = cur
+                    self._request_generation += 1
                     self._signed_in = False
                     path = urlsplit(cur).path.lower()
                     if "exercise" in path:
@@ -747,20 +789,28 @@ class Bot:
                         self.log(f"进入新的 PPT 页：{cur[:100]}")
 
                 self._check_and_sign_in(page)
-                if self.auto_answer:
-                    self._answer(page)
-                elif self.mode == "observe":
-                    self._answer(page)
+
+                if self.auto_answer or self.mode == "observe":
+                    # AI 异步请求等待期加速：如果已有 Future 在等待，使用短片轮询检查
+                    if self._answer_future is not None:
+                        if self._answer_future.done():
+                            self._complete_pending_answer(page)
+                        else:
+                            self._maybe_auto_truncate(page)
+                            self.stop_event.wait(min(poll_interval, 0.04))
+                            continue
+                    else:
+                        self._answer(page)
                 elif not self._skip_answer_logged:
                     self._skip_answer_logged = True
                     self.log("调试模式：已禁用自动答题，课堂页面保持原样（不再重复提示）。")
             except Exception as e:
                 self.log(f"课堂页面处理失败：{e}，稍后重试。")
-                if self.stop_event.wait(min(quiz_interval, RETRY_DELAY)):
+                if self.stop_event.wait(min(poll_interval, RETRY_DELAY)):
                     return
                 continue
 
-            self.stop_event.wait(quiz_interval)
+            self.stop_event.wait(poll_interval)
 
     def _find_new_classroom_page(self, existing_pages: tuple[Page, ...]) -> Optional[Page]:
         """返回一次明确操作后真正新建并已加载为课堂的标签页。"""
@@ -884,7 +934,9 @@ class Bot:
             return False
 
     def _save_exercise_html(self, page: Page) -> None:
-        """普通和调试模式都为每次 exercise 页面保存一份 HTML。"""
+        """保存 exercise 页面 HTML（默认关闭，需配置 save_exercise_html 或 debug_mode 开启）。"""
+        if not (self.config.get("save_exercise_html", False) or self.config.get("debug_mode", False)):
+            return
         now = datetime.now()
         data_dir = os.path.join("data", now.strftime("%Y-%m-%d"))
         path = os.path.join(
@@ -892,9 +944,11 @@ class Bot:
             f"{now.strftime('%H-%M-%S-%f')}-exercise.html",
         )
         try:
+            # 必须在 Playwright 线程读取 HTML
+            content = page.content()
             os.makedirs(data_dir, exist_ok=True)
             with open(path, "w", encoding="utf-8") as file:
-                file.write(page.content())
+                file.write(content)
             self.log(f"题目 HTML 已保存：{path}")
         except Exception as e:
             self.log(f"题目 HTML 保存失败：{e}")
@@ -920,6 +974,11 @@ class Bot:
                 return
         if not self._begin_question(question_id):
             return
+
+        # 题目真正变化时递增代际号
+        if getattr(self, "_last_processed_question_id", "") != question_id:
+            self._last_processed_question_id = question_id
+            self._request_generation += 1
 
         lesson_id = ""
         try:
@@ -970,6 +1029,7 @@ class Bot:
         self._answer_future = future
         self._answer_question_id = question_id
         self._answer_exercise_path = self._exercise_path(page)
+        self._answer_generation = self._request_generation
 
         # 测试桩或缓存结果可能立即完成。
         if future.done():
@@ -1032,6 +1092,7 @@ class Bot:
     def _complete_pending_answer(self, page: Page) -> None:
         future = self._answer_future
         question_id = self._answer_question_id
+        answer_gen = getattr(self, "_answer_generation", 0)
         self._answer_future = None
         self._answer_question_id = ""
         if future is None or not question_id:
@@ -1059,6 +1120,10 @@ class Bot:
                 succeeded = True
                 return
 
+            # 代际与页面状态核验
+            if self._request_generation != answer_gen:
+                self.log("AI 返回时题目代际已发生变更，已丢弃旧答案。")
+                return
             if not self._is_exercise_page(page):
                 self.log("AI 返回前答题页面已关闭，已丢弃旧答案。")
                 return
@@ -1089,7 +1154,15 @@ class Bot:
             if self._current_tracker:
                 self._current_tracker.mark("answer_validated")
 
-            submit_delay = self._int_setting("submit_delay", 1, 0, 300)
+            # 提交前再次确认代际与提交按钮
+            if self._request_generation != answer_gen:
+                self.log("提交前题目代际已变更，已中止提交。")
+                return
+            if not self._has_submit_button(page):
+                self.log("提交前提交按钮已消失，已中止提交。")
+                return
+
+            submit_delay = self._int_setting("submit_delay", 0, 0, 300)
             if submit_delay > 0 and self.stop_event.wait(submit_delay):
                 return
             if self._current_tracker:
@@ -1107,6 +1180,7 @@ class Bot:
         self._answer_future = None
         self._answer_question_id = ""
         self._answer_exercise_path = ""
+        self._answer_generation = 0
         if future is not None:
             future.cancel()
         if self._current_tracker is not None:
@@ -1122,6 +1196,7 @@ class Bot:
         self._answer_future = None
         self._answer_question_id = ""
         self._answer_exercise_path = ""
+        self._answer_generation = 0
         if future is not None:
             future.cancel()
         if self._current_tracker is not None:
@@ -1251,7 +1326,7 @@ class Bot:
                             rect.top < window.innerHeight && rect.left < window.innerWidth;
                     };
                     const roots = [...document.querySelectorAll(
-                        '[data-question-id], [data-problem-id], [data-slide-id], section[class*="slide__cmp"], [class*="question"]'
+                        '[data-question-id], [data-problem-id], [data-slide-id], [class*="slide__cmp"], [class*="question"], .quiz-content'
                     )];
                     const visibleRoots = roots.filter(visible);
                     const idNames = ['data-question-id', 'data-problem-id', 'data-slide-id', 'data-id', 'id'];
@@ -1261,7 +1336,19 @@ class Bot:
                     if (!root) return null;
                     const id = idNames
                         .map(name => root.getAttribute(name)).find(Boolean) || '';
-                    const text = (root.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 4000);
+                    const clone = root.cloneNode(true);
+                    const dynamicSelectors = [
+                        '[class*="time-box"]',
+                        '[class*="countdown"]',
+                        '[class*="timing"]',
+                        '[class*="submit-btn"]',
+                        'button',
+                        '.tips'
+                    ];
+                    dynamicSelectors.forEach(sel => {
+                        clone.querySelectorAll(sel).forEach(el => el.remove());
+                    });
+                    const text = (clone.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 4000);
                     const options = [...root.querySelectorAll('[data-option]')]
                         .filter(visible)
                         .map(el => `${el.getAttribute('data-option') || ''}:${(el.innerText || '').replace(/\\s+/g, ' ').trim()}`);
@@ -1428,9 +1515,9 @@ class Bot:
             if self._submit_ready(page):
                 return True
             try:
-                page.wait_for_timeout(100)
+                page.wait_for_timeout(40)
             except Exception:
-                if self.stop_event.wait(0.1):
+                if self.stop_event.wait(0.04):
                     break
         return False
 
@@ -1568,9 +1655,9 @@ class Bot:
                 self.log("已提交答案。")
                 return True
             try:
-                page.wait_for_timeout(100)
+                page.wait_for_timeout(40)
             except Exception:
-                if self.stop_event.wait(0.1):
+                if self.stop_event.wait(0.04):
                     break
 
         self.log("已点击提交，但提交按钮仍存在，视为未作答，本题不再自动重试。")
