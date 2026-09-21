@@ -39,11 +39,18 @@ def _load_dotenv() -> None:
 # 模块加载时自动加载 .env（仅一次）
 _load_dotenv()
 
+class ConfigError(Exception):
+    """配置读取或校验异常。"""
+    pass
+
+
 # 默认配置
 DEFAULTS: dict[str, Any] = {
     "start_time": "07:00",
     "end_time": "22:00",
     "headless_mode": False,
+    "mode": "observe",  # 运行模式：observe（观察模式）/ auto（自动答题）
+    "auto_sign_in": True,  # 自动签到开关（与是否自动答题解耦）
     "ai_model": "豆包AI",
     "doubao_api_key": "",
     "gemini_api_key": "",
@@ -169,9 +176,15 @@ class Config:
         ).strip():
             errors.append("多AI配置文件不能为空")
 
+        # 运行模式校验
+        if "mode" in settings:
+            mode_val = settings.get("mode")
+            if mode_val not in ("observe", "auto"):
+                errors.append("mode 必须是 observe 或 auto")
+
         # 布尔字段类型
-        for key in ("headless_mode", "debug_mode"):
-            if not isinstance(settings.get(key), bool):
+        for key in ("headless_mode", "debug_mode", "auto_sign_in"):
+            if key in settings and not isinstance(settings.get(key), bool):
                 errors.append(f"{key} 必须是布尔值（true/false）")
 
         # 数值范围校验
@@ -193,6 +206,38 @@ class Config:
                 errors.append(f"{key} 范围应为 {lo}~{hi}")
 
         return errors
+
+    @classmethod
+    def load_strict(cls, config_file: str | os.PathLike) -> "Config":
+        """严格加载配置文件，文件不存在、格式损坏或字段非法时抛出 ConfigError。"""
+        from pathlib import Path
+
+        path = Path(config_file)
+        if not path.exists():
+            raise ConfigError(f"配置文件不存在：{path}")
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ConfigError(f"配置文件 JSON 格式错误：{e}")
+        except OSError as e:
+            raise ConfigError(f"无法读取配置文件：{e}")
+
+        if not isinstance(data, dict):
+            raise ConfigError("配置文件格式非法：顶层必须是 JSON 对象（字典）")
+
+        cfg = cls(str(path))
+        merged = dict(DEFAULTS)
+        merged.update(data)
+        errors = cfg._validate(merged)
+        if errors:
+            raise ConfigError("配置文件校验失败：\n" + "\n".join(f"- {e}" for e in errors))
+
+        with cfg._lock:
+            cfg._data = merged
+        return cfg
+
 
     def _write_file(self) -> None:
         """通过同目录临时文件原子替换配置（调用方须持有 _lock）。"""

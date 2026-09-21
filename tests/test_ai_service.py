@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from src.ai.service import AIService, PROMPT_ANSWER, _MultiAIEndpoint, _compact_error
-from main import _MaxLogLengthFilter
+from src.log import _MaxLogLengthFilter
 
 
 class FakeConfig:

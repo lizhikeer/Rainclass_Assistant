@@ -5,11 +5,6 @@ import threading
 import time
 import tkinter as tk
 from datetime import datetime
-from logging.handlers import (
-    QueueHandler,
-    QueueListener,
-    TimedRotatingFileHandler,
-)
 from pathlib import Path
 from tkinter import messagebox
 
@@ -22,7 +17,19 @@ from src.config import Config
 from src.instance_lock import InstanceLock
 from src.notification import NotificationService
 
-# ==================== 全局配置 ====================
+# ==================== 全局配置与日志 ====================
+
+from src.log import (
+    LOG_FORMAT,
+    DEFAULT_LOG_DIR as LOG_DIR,
+    DEFAULT_LOG_FILE as LOG_FILE,
+    LOG_BACKUP_DAYS,
+    _MaxLogLengthFilter,
+    _bot_log_namer,
+    _log_queue,
+    setup_logging as _core_setup_logging,
+    stop_logging as _core_stop_logging,
+)
 
 APP_TITLE = "雨课堂自动助手"
 APP_WIDTH = 900
@@ -30,20 +37,7 @@ APP_HEIGHT = 700
 APP_MIN_W = 600
 APP_MIN_H = 500
 
-# 日志格式化器
-LOG_FORMAT = logging.Formatter(
-    "%(asctime)s  %(message)s", datefmt="%H:%M:%S"
-)
-
-LOG_DIR = Path("log")
-LOG_FILE = LOG_DIR / "bot.log"
-# 日志保留最近 365 天
-LOG_BACKUP_DAYS = 365
-
-# 队列
-_log_queue: queue.Queue = queue.Queue()
 _gui_log_queue: queue.Queue = queue.Queue()
-_log_listener: QueueListener | None = None
 
 
 class _GuiLogHandler(logging.Handler):
@@ -51,88 +45,23 @@ class _GuiLogHandler(logging.Handler):
         _gui_log_queue.put(self.format(record))
 
 
-class _MaxLogLengthFilter(logging.Filter):
-    """日志长度闸门：超长记录截断后再落盘/上屏。
-
-    模型报错、SDK 调试日志可能携带整页 HTML 或 base64 数据（曾出现
-    单条 315KB 的日志），会在 GUI 控制窗格刷屏并撑爆日志文件。
-    正常业务日志远低于该上限，不受影响。
-    """
-
-    def __init__(self, limit: int = 1000) -> None:
-        super().__init__()
-        self.limit = limit
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            message = record.getMessage()
-        except Exception:
-            return True
-        if len(message) > self.limit:
-            record.msg = (
-                f"{message[:self.limit]}...(日志过长已截断，原始 {len(message)} 字符)"
-            )
-            record.args = None
-        return True
-
-
-def _bot_log_namer(default_name: str) -> str:
-    """把 TimedRotating 默认名 bot.log.YYYY-MM-DD 改成 bot_YYYY-MM-DD.log。"""
-    path = Path(default_name)
-    name = path.name
-    if not name.startswith("bot.log."):
-        return default_name
-    date_part = name[len("bot.log.") :]
-    if len(date_part) == 10 and date_part[4] == "-" and date_part[7] == "-":
-        return str(path.with_name(f"bot_{date_part}.log"))
-    return default_name
-
-
 def _setup_logging() -> None:
-    global _log_listener
-    if _log_listener is not None:
-        _stop_logging()
-    root_logger = logging.getLogger()
-    # 通过环境变量 RAINCLASS_DEBUG=1 开启 DEBUG 级别日志
-    root_logger.setLevel(logging.DEBUG if os.environ.get("RAINCLASS_DEBUG") else logging.INFO)
-    root_logger.handlers.clear()
-
-    # SDK 的 DEBUG 日志会包含完整请求体（包括截图 base64 和临时图片 URL）。
-    # 应用调试模式只保留自身日志，避免日志膨胀和敏感数据泄露。
-    for noisy_logger in ("openai", "httpx", "httpcore", "urllib3", "asyncio"):
-        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
-
-    qh = QueueHandler(_log_queue)
-    root_logger.addHandler(qh)
-
-    length_gate = _MaxLogLengthFilter()
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    fh = TimedRotatingFileHandler(
-        LOG_FILE,
-        when="midnight",
-        backupCount=LOG_BACKUP_DAYS,
-        encoding="utf-8",
-    )
-    fh.namer = _bot_log_namer
-    fh.setFormatter(LOG_FORMAT)
-    fh.addFilter(length_gate)
-
+    """配置 GUI 运行时的日志分发。"""
     gh = _GuiLogHandler()
     gh.setFormatter(LOG_FORMAT)
     gh.addFilter(_MaxLogLengthFilter(120))
 
-    _log_listener = QueueListener(_log_queue, fh, gh)
-    _log_listener.start()
+    _core_setup_logging(
+        log_dir=LOG_DIR,
+        enable_console=False,
+        enable_file=True,
+        extra_handlers=[gh],
+    )
 
 
 def _stop_logging() -> None:
-    global _log_listener
-    if _log_listener is not None:
-        listener = _log_listener
-        listener.stop()
-        for handler in listener.handlers:
-            handler.close()
-        _log_listener = None
+    _core_stop_logging()
+
 
 
 # ==================== 主应用 ====================

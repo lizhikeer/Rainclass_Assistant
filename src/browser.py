@@ -3,6 +3,7 @@
 首次启动需运行 `playwright install chromium`
 """
 
+import json
 import logging
 import os
 import subprocess
@@ -34,7 +35,7 @@ YUKETANG_URL = YUKETANG_SERVERS[DEFAULT_SERVER]
 _browsers_checked = False
 
 
-def _ensure_playwright_browsers() -> None:
+def _ensure_playwright_browsers(auto_install: bool = True) -> None:
     """确保 Playwright 浏览器已安装（仅首次调用时检测）。"""
     global _browsers_checked
     if _browsers_checked:
@@ -47,7 +48,12 @@ def _ensure_playwright_browsers() -> None:
             browser.close()
         finally:
             pw.stop()
-    except Exception:
+    except Exception as e:
+        if not auto_install:
+            raise RuntimeError(
+                f"Playwright Chromium 启动失败：{e}\n"
+                "后台服务模式已禁用自动下载。请确保环境中已预装浏览器及系统依赖（如 playwright install --with-deps chromium）。"
+            ) from e
         logger.info("Playwright 浏览器未安装，正在自动安装...")
         result = subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
@@ -81,6 +87,7 @@ class BrowserManager:
         state_file: str = DEFAULT_STATE_FILE,
         debug_port: Optional[int] = None,
         base_url: Optional[str] = None,
+        auto_install: bool = True,
     ):
         self._headless = headless
         self._state_file = state_file
@@ -91,6 +98,7 @@ class BrowserManager:
         self.home_url = f"{self.base_url}/v2/web/"
         # 获取 Cookies 用登录页（含 #tab-student 登录入口）
         self.login_url = f"{self.base_url}/web/"
+        self._auto_install = auto_install
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -135,10 +143,26 @@ class BrowserManager:
         """浏览器是否正在运行。"""
         return self._browser is not None and self._browser.is_connected()
 
+    def validate_session(self) -> tuple[bool, str]:
+        """检查会话文件是否存在且格式有效。"""
+        if not os.path.exists(self._state_file):
+            return False, f"未找到会话文件：{self._state_file}"
+        try:
+            with open(self._state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return False, f"会话文件格式非法（非 JSON 对象）：{self._state_file}"
+            if not data.get("cookies") and not data.get("origins"):
+                return False, f"会话文件中缺少有效 cookies 或 origins：{self._state_file}"
+            return True, "OK"
+        except Exception as e:
+            return False, f"会话文件无法解析：{e}"
+
     @property
     def has_session(self) -> bool:
-        """是否存在已保存的会话状态。"""
-        return os.path.exists(self._state_file)
+        """是否存在有效的会话状态。"""
+        valid, _ = self.validate_session()
+        return valid
 
     # ---- 启动 / 停止 ----
 
@@ -149,7 +173,7 @@ class BrowserManager:
             return True
 
         try:
-            _ensure_playwright_browsers()
+            _ensure_playwright_browsers(auto_install=self._auto_install)
             self._playwright = sync_playwright().start()
 
             # 如果有保存的会话状态，则恢复

@@ -63,9 +63,21 @@ COUNTDOWN_STATE_WORDS = (
     ("老师可能会随时结束答题", "该题不限时，老师可随时收题"),
 )
 
+from src.timing import QuizTimingTracker
+
+
+class BotState:
+    """Bot 运行状态枚举。"""
+    IDLE = "idle"
+    NEEDS_LOGIN = "needs_login"
+    WAITING_FOR_CLASS = "waiting_for_class"
+    IN_CLASSROOM = "in_classroom"
+    STOPPED = "stopped"
+    ERROR = "error"
+
 
 class Bot:
-    """课堂自动化 Bot。在独立线程中运行主循环。"""
+    """课堂自动化 Bot。在独立线程或进程中运行主循环。"""
 
     def __init__(
         self,
@@ -75,14 +87,32 @@ class Bot:
         notification: "NotificationService",  # type: ignore
         stop_event: threading.Event,
         auto_answer: bool = True,
+        mode: Optional[str] = None,
+        metrics_file: Optional[str | os.PathLike] = None,
     ):
         self.config = config
         self.browser = browser
         self.ai = ai_service
         self.notification = notification
         self.stop_event = stop_event
-        # 调试开关：关闭后只进课堂、签到，不发 AI 请求也不点击提交。
-        self.auto_answer = auto_answer
+
+        # 模式判定：优先级 mode 参数 > config.get("mode") > auto_answer 参数
+        if mode is not None:
+            self.mode = mode
+            self.auto_answer = (mode == "auto")
+        elif config is not None and config.get("mode") in ("auto", "observe"):
+            self.mode = config.get("mode")
+            self.auto_answer = (self.mode == "auto")
+        else:
+            self.auto_answer = auto_answer
+            self.mode = "auto" if auto_answer else "observe"
+
+        self.metrics_file = metrics_file
+        self.state = BotState.IDLE
+        self._current_tracker: Optional[QuizTimingTracker] = None
+        self._last_quiz_detected_time: Optional[float] = None
+        self._last_quiz_detection_source: str = "exercise_page"
+
         self._skip_answer_logged = False
         self._question_states: dict[str, tuple[str, float, int]] = {}
         self._last_notify_time = 0.0
@@ -164,23 +194,32 @@ class Bot:
     # ==================== 主循环 ====================
 
     def run(self) -> None:
-        """Bot 主循环（在后台线程中执行）。
+        """Bot 主循环（在后台线程或独立 Worker 中执行）。
 
         浏览器创建/导航/关闭全在本线程内完成，避免 Playwright 跨线程报错。
         """
         try:
+            self.state = BotState.IDLE
             # 浏览器创建、使用和关闭都留在 Bot 线程内。
             if not self.browser.start():
-                self.log("浏览器启动失败，无法开始自动答题。")
+                self.state = BotState.ERROR
+                self.log("浏览器启动失败，无法开始运行。")
                 return
             self.log("浏览器已就绪。")
 
-            if not self.browser.has_session:
-                self.log("⚠ 未检测到登录会话（browser_state.json），请先在设置中「获取登录 Cookies」。")
-            elif self.browser.navigate_to_class() and self.browser.is_logged_in():
-                self.log("登录会话有效。")
-            else:
-                self.log("⚠ 登录会话可能已过期，请重新「获取登录 Cookies」后再启动。")
+            if not getattr(self.browser, "has_session", False):
+                self.state = BotState.NEEDS_LOGIN
+                self.log("⚠ [NEEDS_LOGIN] 未检测到有效的登录会话（browser_state.json）。")
+                self.log("修复指引：请在具有图形界面的环境登录雨课堂，将导出的 browser_state.json 存放到数据目录中，然后重启本服务。")
+                return
+            elif not (self.browser.navigate_to_class() and self.browser.is_logged_in()):
+                self.state = BotState.NEEDS_LOGIN
+                self.log("⚠ [NEEDS_LOGIN] 登录会话无效或已过期（未能通过学生端页面登录校验）。")
+                self.log("修复指引：请重新获取有效的 browser_state.json 并覆盖数据目录中的同名文件。")
+                return
+
+            self.log("登录会话有效。")
+            self.state = BotState.WAITING_FOR_CLASS
 
             while not self.stop_event.is_set():
                 check_interval = self._int_setting("check_interval", 60, 5, 3600)
@@ -203,11 +242,14 @@ class Bot:
                 self.stop_event.wait(check_interval)
 
         except Exception:
+            self.state = BotState.ERROR
             self.log(f"发生意外错误：{traceback.format_exc()}")
         finally:
             self.browser.stop()
             self.ai.shutdown()
-            self.log("浏览器已关闭。")
+            if self.state not in (BotState.NEEDS_LOGIN, BotState.ERROR):
+                self.state = BotState.STOPPED
+            self.log("服务已退出，浏览器已关闭。")
 
     # ==================== 课程检测 ====================
 
@@ -698,12 +740,16 @@ class Bot:
                     self._signed_in = False
                     path = urlsplit(cur).path.lower()
                     if "exercise" in path:
+                        self._last_quiz_detected_time = time.monotonic()
+                        self._last_quiz_detection_source = "exercise_navigation"
                         self.log(f"进入新的习题页：{cur[:100]}")
                     elif re.search(r"/ppt(?:/|$)", path):
                         self.log(f"进入新的 PPT 页：{cur[:100]}")
 
                 self._check_and_sign_in(page)
                 if self.auto_answer:
+                    self._answer(page)
+                elif self.mode == "observe":
                     self._answer(page)
                 elif not self._skip_answer_logged:
                     self._skip_answer_logged = True
@@ -736,6 +782,8 @@ class Bot:
         """消费雨课堂的新题提示，让页面切到最新题目。"""
         prompt = page.get_by_text("你有新的课堂习题", exact=False)
         if self._click_first_visible(prompt):
+            self._last_quiz_detected_time = time.monotonic()
+            self._last_quiz_detection_source = "prompt_click"
             self.log("发现新的课堂习题，已点击提示。")
             return True
         return False
@@ -748,6 +796,10 @@ class Bot:
         精确匹配文本恰为「签到」的可点击元素，避免误匹配「已签到 / 签到记录」等
         静态文案；只有找不到签到按钮属正常情况（静默返回），真正的失败会记日志。
         """
+        if self.mode == "observe":
+            return
+        if not self.config.get("auto_sign_in", True):
+            return
         if self._signed_in:
             return
         sign_in_btn = page.get_by_text("签到", exact=True)
@@ -793,6 +845,12 @@ class Bot:
         if not self._exercise_html_saved:
             self._exercise_html_saved = True
             self._save_exercise_html(page)
+
+        if self.mode == "observe":
+            if not self._skip_answer_logged:
+                self._skip_answer_logged = True
+                self.log("观察模式：已检测到习题页面，禁止调用 AI、点击选项与提交（页面保持原样）。")
+            return
 
         if not self._has_submit_button(page):
             if self._answer_future is not None:
@@ -863,8 +921,29 @@ class Bot:
         if not self._begin_question(question_id):
             return
 
+        lesson_id = ""
+        try:
+            lesson_id = self._lesson_id_from_url(page.url)
+        except Exception:
+            pass
+
+        detected_time = getattr(self, "_last_quiz_detected_time", None) or time.monotonic()
+        detection_source = getattr(self, "_last_quiz_detection_source", "exercise_dom")
+
+        tracker = QuizTimingTracker(
+            question_id=question_id,
+            lesson_id=lesson_id,
+            account_id="user",
+            detection_source=detection_source,
+            metrics_file=self.metrics_file,
+        )
+        tracker.mark("question_detected", detected_time)
+        tracker.mark("question_ready")
+        self._current_tracker = tracker
+
         self.log("检测到可作答题目，开始获取 AI 答案。")
         try:
+            tracker.mark("ai_request_started")
             if time.time() - self._last_notify_time > 30:
                 self._notify(
                     "自动答题提醒",
@@ -961,6 +1040,8 @@ class Bot:
         succeeded = False
         try:
             answer_text = future.result()
+            if self._current_tracker:
+                self._current_tracker.mark("ai_response_received")
             self.log(f"AI 返回：{answer_text}")
             if self._is_failed_answer(answer_text):
                 self.log("AI 未返回有效答案，本题不再自动重试。")
@@ -1005,9 +1086,14 @@ class Bot:
             if not self._wait_submit_ready(page):
                 self.log("选项点击未生效（提交按钮未进入可提交状态），本题不再自动重试。")
                 return
+            if self._current_tracker:
+                self._current_tracker.mark("answer_validated")
+
             submit_delay = self._int_setting("submit_delay", 1, 0, 300)
             if submit_delay > 0 and self.stop_event.wait(submit_delay):
                 return
+            if self._current_tracker:
+                self._current_tracker.mark("submit_clicked")
             succeeded = self._submit_answer(page)
         except Exception as e:
             self.log(f"AI 答题结果处理失败：{e}")
@@ -1023,6 +1109,9 @@ class Bot:
         self._answer_exercise_path = ""
         if future is not None:
             future.cancel()
+        if self._current_tracker is not None:
+            self._current_tracker.finish(True, error_reason=reason)
+            self._current_tracker = None
         if question_id:
             self.log(f"{reason}，本题已结束处理。")
             self._finish_question(question_id, True)
@@ -1035,6 +1124,9 @@ class Bot:
         self._answer_exercise_path = ""
         if future is not None:
             future.cancel()
+        if self._current_tracker is not None:
+            self._current_tracker.finish(False, error_reason=reason)
+            self._current_tracker = None
         if question_id:
             self.log(f"{reason}，已丢弃旧题 AI 请求。")
             self._finish_question(question_id, False)
@@ -1053,6 +1145,9 @@ class Bot:
         attempts = self._question_states.get(question_id, ("", 0.0, 1))[2]
         state = "completed" if succeeded else "failed"
         self._set_question_state(question_id, state, attempts)
+        if self._current_tracker is not None:
+            self._current_tracker.finish(succeeded)
+            self._current_tracker = None
         if succeeded:
             self.log("当前题目已确认处理完成。")
         else:
@@ -1468,6 +1563,8 @@ class Bot:
         deadline = time.monotonic() + 10
         while not self.stop_event.is_set() and time.monotonic() < deadline:
             if not self._is_exercise_page(page) or not self._has_submit_button(page):
+                if self._current_tracker:
+                    self._current_tracker.mark("submit_confirmed")
                 self.log("已提交答案。")
                 return True
             try:
