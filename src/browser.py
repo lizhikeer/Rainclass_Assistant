@@ -9,7 +9,9 @@ import os
 import subprocess
 import sys
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext, Playwright
 
@@ -17,6 +19,30 @@ logger = logging.getLogger(__name__)
 
 # 默认会话状态文件（存储 cookies + localStorage）
 DEFAULT_STATE_FILE = "browser_state.json"
+
+
+def validate_session_data(data: Any, expected_base_url: Optional[str] = None) -> tuple[bool, str]:
+    """验证会话 JSON 数据结构与雨课堂站点绑定。"""
+    if not isinstance(data, dict):
+        return False, "会话数据格式非法（非 JSON 对象）"
+    cookies = data.get("cookies", [])
+    origins = data.get("origins", [])
+    if not cookies and not origins:
+        return False, "会话数据中缺少有效 cookies 或 origins"
+
+    if expected_base_url and cookies:
+        expected_host = urlsplit(expected_base_url).hostname or ""
+        expected_root_domain = ".".join(expected_host.split(".")[-2:]) if "." in expected_host else expected_host
+        has_matching_domain = False
+        for c in cookies:
+            c_domain = (c.get("domain") or "").lstrip(".").lower()
+            if c_domain and (expected_host.endswith(c_domain) or c_domain.endswith(expected_root_domain) or "yuketang" in c_domain):
+                has_matching_domain = True
+                break
+        if not has_matching_domain:
+            return False, f"会话 Cookie 域名与当前配置的雨课堂服务器 ({expected_host}) 不匹配"
+
+    return True, "OK"
 
 # 雨课堂各服务器主页
 YUKETANG_SERVERS: dict[str, str] = {
@@ -103,6 +129,7 @@ class BrowserManager:
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        self._last_session_save_time: float = 0.0
 
     @staticmethod
     def _resolve_debug_port(debug_port: Optional[int]) -> Optional[int]:
@@ -144,17 +171,13 @@ class BrowserManager:
         return self._browser is not None and self._browser.is_connected()
 
     def validate_session(self) -> tuple[bool, str]:
-        """检查会话文件是否存在且格式有效。"""
+        """检查会话文件是否存在且格式有效，并校验雨课堂站点绑定。"""
         if not os.path.exists(self._state_file):
             return False, f"未找到会话文件：{self._state_file}"
         try:
             with open(self._state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if not isinstance(data, dict):
-                return False, f"会话文件格式非法（非 JSON 对象）：{self._state_file}"
-            if not data.get("cookies") and not data.get("origins"):
-                return False, f"会话文件中缺少有效 cookies 或 origins：{self._state_file}"
-            return True, "OK"
+            return validate_session_data(data, self.base_url)
         except Exception as e:
             return False, f"会话文件无法解析：{e}"
 
@@ -296,9 +319,13 @@ class BrowserManager:
                 logger.error("等待登录超时。")
                 return False
 
-            # 保存会话状态
-            context.storage_state(path=self._state_file)
-            logger.info(f"会话状态已保存到 {self._state_file}。")
+            # 原子保存会话状态
+            target_path = Path(self._state_file)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = target_path.with_suffix(".tmp")
+            context.storage_state(path=str(temp_path))
+            os.replace(temp_path, target_path)
+            logger.info(f"会话状态已原子保存到 {self._state_file}。")
 
             return True
         except Exception as e:
@@ -320,11 +347,73 @@ class BrowserManager:
             except Exception:
                 pass
 
-    def save_session(self) -> None:
-        """保存当前会话状态到文件。"""
-        if self._context and self.is_running:
-            self._context.storage_state(path=self._state_file)
-            logger.info("会话状态已保存。")
+    def save_session(self, force: bool = False) -> bool:
+        """原子保存当前有效会话状态到文件。
+
+        规则：
+        1. 必须在已确认登录有效时保存，严禁将未登录状态覆盖有效备份；
+        2. 节流机制：非强制保存时，至少间隔 24 小时才落盘一次；
+        3. 临时文件 + os.replace 原子写入。
+        """
+        if not self._context or not self.is_running:
+            return False
+        if not self.is_logged_in():
+            logger.debug("当前页面未处于已登录状态，跳过会话持久化以保护有效备份。")
+            return False
+
+        now = time.time()
+        if not force and (now - self._last_session_save_time < 86400.0):
+            return True  # 节流跳过
+
+        try:
+            target_path = Path(self._state_file)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = target_path.with_suffix(".tmp")
+
+            self._context.storage_state(path=str(temp_path))
+            os.replace(temp_path, target_path)
+            self._last_session_save_time = now
+            logger.info("已原子保存有效登录会话至: %s", self._state_file)
+            return True
+        except Exception as e:
+            logger.warning("保存会话文件失败: %s", e)
+            return False
+
+    def reload_context(self, new_state_file: Optional[str] = None) -> bool:
+        """受控重启上下文加载新会话（保证旧上下文先关闭，不同时操作账号）。"""
+        if new_state_file:
+            self._state_file = new_state_file
+
+        logger.info("正在受控重启浏览器上下文以加载新会话...")
+        try:
+            if self._page and not self._page.is_closed():
+                try:
+                    self._page.close()
+                except Exception:
+                    pass
+            self._page = None
+
+            if self._context:
+                try:
+                    self._context.close()
+                except Exception:
+                    pass
+                self._context = None
+
+            if not self.ensure_running():
+                return False
+
+            storage_state = self._state_file if self.has_session else None
+            self._context = self._browser.new_context(
+                storage_state=storage_state,
+                viewport={"width": 1280, "height": 720},
+            )
+            self._page = self._context.new_page()
+            logger.info("浏览器上下文已受控重载完成。")
+            return True
+        except Exception as e:
+            logger.error("受控重载浏览器上下文失败: %s", e)
+            return False
 
     # ---- 导航 ----
 
@@ -368,9 +457,27 @@ class BrowserManager:
             return False
 
     def is_logged_in(self) -> bool:
-        """快速检查当前页面是否已登录（tab-student 元素存在）。"""
+        """检查当前页面真实登录状态（结合 DOM 标志与重定向等可观察证据）。"""
+        if not self.is_running or self._page is None:
+            return False
         try:
-            self.page.wait_for_selector("#tab-student", timeout=3_000)
+            if self.page.is_closed():
+                return False
+            cur_url = self.page.url.lower()
+            # 1. 检查可观察的未登录重定向信号
+            if any(k in cur_url for k in ("/login", "oauth", "redirect_url", "service=")):
+                return False
+
+            # 2. 检查未登录明确标志（密码框）
+            if self.page.locator('input[type="password"]').count() > 0:
+                return False
+
+            # 3. 检查学生端核心已登录标志
+            if self.page.locator("#tab-student").count() > 0:
+                return True
+
+            # 4. 短超时探测
+            self.page.wait_for_selector("#tab-student", timeout=1_500)
             return True
         except Exception:
             return False

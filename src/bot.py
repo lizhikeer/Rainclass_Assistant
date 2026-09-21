@@ -23,6 +23,19 @@ from src.browser import DEFAULT_SERVER, YUKETANG_SERVERS
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 from src.ai.models import RoundDecision
+from src.cleaner import ArtifactCleaner
+from src.status import ServiceState, StatusTracker
+from src.storage import (
+    QuizStorage,
+    STAGE_AI_REQUESTED,
+    STAGE_CONFIRMED,
+    STAGE_DETECTED,
+    STAGE_FAILED,
+    STAGE_OPTIONS_CLICKED,
+    STAGE_SKIPPED,
+    STAGE_SUBMITTING,
+    STAGE_UNKNOWN,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +82,15 @@ from src.timing import QuizTimingTracker
 
 
 class BotState:
-    """Bot 运行状态枚举。"""
-    IDLE = "idle"
+    """Bot 运行状态枚举（完全对齐长期运行规范并保持旧常量兼容）。"""
+    STARTING = "starting"
+    IDLE = "starting"
     NEEDS_LOGIN = "needs_login"
-    WAITING_FOR_CLASS = "waiting_for_class"
-    IN_CLASSROOM = "in_classroom"
+    WAITING_FOR_CLASS = "waiting_class"
+    IN_CLASSROOM = "monitoring"
+    MONITORING = "monitoring"
+    ANSWERING = "answering"
+    STOPPING = "stopping"
     STOPPED = "stopped"
     ERROR = "error"
 
@@ -91,12 +108,19 @@ class Bot:
         auto_answer: bool = True,
         mode: Optional[str] = None,
         metrics_file: Optional[str | os.PathLike] = None,
+        status_tracker: Optional[StatusTracker] = None,
+        storage: Optional[QuizStorage] = None,
+        cleaner: Optional[ArtifactCleaner] = None,
     ):
         self.config = config
         self.browser = browser
         self.ai = ai_service
         self.notification = notification
         self.stop_event = stop_event
+        self.status_tracker = status_tracker
+        self.storage = storage
+        self.cleaner = cleaner
+        self.account_id = str(self.config.get("account", "default")) if self.config else "default"
 
         # 模式判定：优先级 mode 参数 > config.get("mode") > auto_answer 参数
         if mode is not None:
@@ -111,6 +135,8 @@ class Bot:
 
         self.metrics_file = metrics_file
         self.state = BotState.IDLE
+        self._consecutive_errors = 0
+        self._last_clean_time = 0.0
         self._current_tracker: Optional[QuizTimingTracker] = None
         self._last_quiz_detected_time: Optional[float] = None
         self._last_quiz_detection_source: str = "exercise_page"
@@ -148,6 +174,33 @@ class Bot:
         切勿再二次 emit（例如同时走其他打印通道），否则同一条日志会打印两遍。
         """
         logger.info(message)
+
+    def _update_state(self, state: str, reason: str = "", **kwargs) -> None:
+        """更新 Bot 状态并同步上报给 StatusTracker。"""
+        self.state = state
+        if self.status_tracker is not None:
+            try:
+                svc_state = ServiceState(state)
+            except ValueError:
+                svc_state = ServiceState.MONITORING
+            self.status_tracker.set_state(svc_state, reason=reason, **kwargs)
+
+    def heartbeat(self) -> None:
+        """刷新心跳。"""
+        if self.status_tracker is not None:
+            self.status_tracker.heartbeat()
+
+    def _maybe_run_cleaner(self) -> None:
+        """低频执行数据目录工件清理。"""
+        if self.cleaner is None:
+            return
+        now = time.monotonic()
+        if now - self._last_clean_time >= 3600.0:
+            self._last_clean_time = now
+            try:
+                self.cleaner.clean()
+            except Exception as e:
+                logger.debug("执行工件清理异常: %s", e)
 
     def _int_setting(self, key: str, default: int, minimum: int, maximum: int) -> int:
         try:
@@ -205,29 +258,33 @@ class Bot:
         浏览器创建/导航/关闭全在本线程内完成，避免 Playwright 跨线程报错。
         """
         try:
-            self.state = BotState.IDLE
+            self._update_state(BotState.STARTING, "正在启动浏览器与检查会话")
             # 浏览器创建、使用和关闭都留在 Bot 线程内。
             if not self.browser.start():
-                self.state = BotState.ERROR
+                self._update_state(BotState.ERROR, "浏览器启动失败")
                 self.log("浏览器启动失败，无法开始运行。")
                 return
             self.log("浏览器已就绪。")
 
             if not getattr(self.browser, "has_session", False):
-                self.state = BotState.NEEDS_LOGIN
+                self._update_state(BotState.NEEDS_LOGIN, "未检测到有效的登录会话")
                 self.log("⚠ [NEEDS_LOGIN] 未检测到有效的登录会话（browser_state.json）。")
                 self.log("修复指引：请在具有图形界面的环境登录雨课堂，将导出的 browser_state.json 存放到数据目录中，然后重启本服务。")
                 return
             elif not (self.browser.navigate_to_class() and self.browser.is_logged_in()):
-                self.state = BotState.NEEDS_LOGIN
+                self._update_state(BotState.NEEDS_LOGIN, "登录会话无效或已过期")
                 self.log("⚠ [NEEDS_LOGIN] 登录会话无效或已过期（未能通过学生端页面登录校验）。")
                 self.log("修复指引：请重新获取有效的 browser_state.json 并覆盖数据目录中的同名文件。")
                 return
 
             self.log("登录会话有效。")
-            self.state = BotState.WAITING_FOR_CLASS
+            # 适当时机原子保存有效会话（节流保护）
+            self.browser.save_session(force=False)
+            self._update_state(BotState.WAITING_FOR_CLASS, "登录会话有效，开始检索课程")
 
             while not self.stop_event.is_set():
+                self.heartbeat()
+                self._maybe_run_cleaner()
                 check_interval = self._int_setting("check_interval", 60, 5, 3600)
                 current_time = time.strftime("%H:%M", time.localtime())
                 start_time = self.config.get("start_time", "07:00")
@@ -248,13 +305,15 @@ class Bot:
                 self.stop_event.wait(check_interval)
 
         except Exception:
-            self.state = BotState.ERROR
+            self._update_state(BotState.ERROR, f"主循环发生意外错误: {traceback.format_exc()}")
             self.log(f"发生意外错误：{traceback.format_exc()}")
         finally:
             self.browser.stop()
             self.ai.shutdown()
+            if self.notification:
+                self.notification.shutdown()
             if self.state not in (BotState.NEEDS_LOGIN, BotState.ERROR):
-                self.state = BotState.STOPPED
+                self._update_state(BotState.STOPPED, "服务已退出，浏览器已关闭")
             self.log("服务已退出，浏览器已关闭。")
 
     # ==================== 课程检测 ====================
@@ -564,7 +623,7 @@ class Bot:
             path = urlsplit(url).path.lower()
         except Exception:
             return ""
-        match = re.search(r"/lesson/(?:fullscreen/v\d+/)?(\d+)(?:/|$)", path)
+        match = re.search(r"/lesson/(?:fullscreen/v\d+/)?([a-zA-Z0-9_\-]+)(?:/|$)", path)
         return match.group(1) if match else ""
 
     def _pages_for_lesson(self, lesson_id: str, current_page: Page) -> list[Page]:
@@ -714,10 +773,22 @@ class Bot:
         self.browser.use_page(page)
         self._last_classroom_url = ""
         self.log("我去上课啦！")
+        lesson_id = ""
+        try:
+            lesson_id = self._lesson_id_from_url(page.url)
+        except Exception:
+            pass
+        self._update_state(
+            BotState.MONITORING,
+            "已进入课堂，正在监控签到与习题",
+            classroom_id=lesson_id,
+            classroom_url=page.url,
+        )
 
         invalid_checks = 0
 
         while not self.stop_event.is_set():
+            self.heartbeat()
             poll_interval = self._classroom_poll_interval()
             try:
                 # 页面关闭即刻退出
@@ -807,11 +878,36 @@ class Bot:
                     self._skip_answer_logged = True
                     self.log("调试模式：已禁用自动答题，课堂页面保持原样（不再重复提示）。")
             except Exception as e:
-                self.log(f"课堂页面处理失败：{e}，稍后重试。")
-                if self.stop_event.wait(min(poll_interval, RETRY_DELAY)):
+                # 区分登录失效与网络/页面临时故障
+                try:
+                    is_logged = self.browser.is_logged_in()
+                except Exception:
+                    is_logged = True
+                if not is_logged:
+                    self._update_state(BotState.NEEDS_LOGIN, "运行中登录会话失效（未能通过页面登录校验）")
+                    self.log("运行中检测到雨课堂登录会话已失效，正在暂停答题并提醒登录。")
+                    self._notify("登录失效提醒", "雨课堂登录已失效，请重新导入会话。")
                     return
+
+                self._consecutive_errors += 1
+                if self._consecutive_errors > 5:
+                    self._update_state(BotState.ERROR, f"课堂监控连续异常达到上限 (5 次): {e}")
+                    self.log(f"课堂监控连续异常达到上限 (5 次)，停止监控：{e}")
+                    return
+
+                backoff = min(60.0, 2.0 * (2 ** (self._consecutive_errors - 1)))
+                self.log(f"课堂页面处理异常 (第 {self._consecutive_errors}/5 次)：{e}，将在 {backoff:.1f} 秒后退避恢复...")
+                self._abandon_pending_answer("网络/页面异常退避恢复，丢弃在途 AI 请求")
+                self._request_generation += 1
+                if self.stop_event.wait(backoff):
+                    return
+                try:
+                    self.browser.ensure_running()
+                except Exception:
+                    pass
                 continue
 
+            self._consecutive_errors = 0
             self.stop_event.wait(poll_interval)
 
     def _find_new_classroom_page(self, existing_pages: tuple[Page, ...]) -> Optional[Page]:
@@ -988,8 +1084,51 @@ class Bot:
         except Exception:
             pass
 
+        self._update_state(
+            BotState.ANSWERING,
+            f"正在作答题目: {question_id}",
+            classroom_id=lesson_id,
+            active_question_id=question_id,
+        )
+
         detected_time = getattr(self, "_last_quiz_detected_time", None) or time.monotonic()
         detection_source = getattr(self, "_last_quiz_detection_source", "exercise_dom")
+
+        if self.storage:
+            # 1. 检查此前是否已经确认作答完毕
+            if self.storage.has_confirmed(self.account_id, lesson_id, question_id):
+                self.log("持久化记录显示该题目此前已确认提交，跳过重复作答。")
+                self._update_state(BotState.MONITORING, "题目已作答，继续监控")
+                return
+
+            # 2. 检查此前是否在 submitting/unknown 崩溃
+            prev = self.storage.get_latest_record(self.account_id, lesson_id, question_id)
+            if prev and prev.get("stage") in (STAGE_SUBMITTING, STAGE_UNKNOWN):
+                prev_gen = prev.get("request_generation", self._request_generation)
+                if not self._has_submit_button(page):
+                    self.storage.record_stage(
+                        self.account_id, lesson_id, question_id, prev_gen,
+                        stage=STAGE_CONFIRMED, submission_confirmed=1,
+                        error_reason="崩溃恢复核对：页面提交按钮已消失",
+                    )
+                    self.log("恢复核对：页面提交按钮已消失，确认此前已提交成功。")
+                    self._update_state(BotState.MONITORING, "恢复核对已提交，继续监控")
+                    return
+                else:
+                    self.storage.record_stage(
+                        self.account_id, lesson_id, question_id, prev_gen,
+                        stage=STAGE_UNKNOWN, error_reason="崩溃恢复核对状态不明，跳过以防误提交",
+                    )
+                    self.log("恢复核对：崩溃前状态不明且页面按钮仍在，跳过自动作答以避免误提交。")
+                    self._notify("答题恢复提醒", f"题目 {question_id} 崩溃前状态不明，已跳过避免误提交。")
+                    self._update_state(BotState.MONITORING, "状态不明已跳过，继续监控")
+                    return
+
+            # 记录首次检测
+            self.storage.record_stage(
+                self.account_id, lesson_id, question_id, self._request_generation,
+                stage=STAGE_DETECTED, detection_source=detection_source,
+            )
 
         tracker = QuizTimingTracker(
             question_id=question_id,
@@ -1031,6 +1170,11 @@ class Bot:
                 deadline=deadline,
                 generation=self._request_generation,
             )
+            if self.storage:
+                self.storage.record_stage(
+                    self.account_id, lesson_id, question_id, self._request_generation,
+                    stage=STAGE_AI_REQUESTED,
+                )
         except Exception as e:
             self.log(f"AI 答题请求启动失败：{e}")
             self._finish_question(question_id, False)
@@ -1108,6 +1252,16 @@ class Bot:
         if future is None or not question_id:
             return
 
+        if self.stop_event.is_set() or self.state == BotState.STOPPING:
+            self.log("服务正在停止退出，已中止新提交发起。")
+            return
+
+        lesson_id = ""
+        try:
+            lesson_id = self._lesson_id_from_url(page.url)
+        except Exception:
+            pass
+
         succeeded = False
         try:
             answer_text = future.result()
@@ -1126,10 +1280,20 @@ class Bot:
                 return
             if qtype == "unknown":
                 self.log("AI 模型没有可用的视觉能力，已跳过本题。")
+                if self.storage:
+                    self.storage.record_stage(
+                        self.account_id, lesson_id, question_id, answer_gen,
+                        stage=STAGE_SKIPPED, error_reason="AI模型无可用视觉能力",
+                    )
                 succeeded = True
                 return
             if qtype in ("fill", "sub"):
                 self.log("AI 判定为主观/填空题，不自动作答，本题结束。")
+                if self.storage:
+                    self.storage.record_stage(
+                        self.account_id, lesson_id, question_id, answer_gen,
+                        stage=STAGE_SKIPPED, error_reason="主观/填空题跳过",
+                    )
                 succeeded = True
                 return
 
@@ -1167,6 +1331,13 @@ class Bot:
             if self._current_tracker:
                 self._current_tracker.mark("answer_validated")
 
+            if self.storage:
+                self.storage.record_stage(
+                    self.account_id, lesson_id, question_id, answer_gen,
+                    stage=STAGE_OPTIONS_CLICKED,
+                    submitted_answer=str(letters or raw_answer),
+                )
+
             # 提交前再次确认代际与提交按钮
             if self._request_generation != answer_gen:
                 self.log("提交前题目代际已变更，已中止提交。")
@@ -1178,6 +1349,13 @@ class Bot:
             submit_delay = self._int_setting("submit_delay", 0, 0, 300)
             if submit_delay > 0 and self.stop_event.wait(submit_delay):
                 return
+
+            if self.storage:
+                self.storage.record_stage(
+                    self.account_id, lesson_id, question_id, answer_gen,
+                    stage=STAGE_SUBMITTING,
+                )
+
             if self._current_tracker:
                 self._current_tracker.mark("submit_clicked")
             succeeded = self._submit_answer(page)
@@ -1236,10 +1414,30 @@ class Bot:
         if self._current_tracker is not None:
             self._current_tracker.finish(succeeded)
             self._current_tracker = None
+
+        if self.storage:
+            lesson_id = ""
+            try:
+                lesson_id = self._lesson_id_from_url(self.browser.page.url)
+            except Exception:
+                pass
+            gen = self._answer_generation or self._request_generation
+            if succeeded:
+                self.storage.record_stage(
+                    self.account_id, lesson_id, question_id, gen,
+                    stage=STAGE_CONFIRMED, submission_confirmed=1,
+                )
+            else:
+                self.storage.record_stage(
+                    self.account_id, lesson_id, question_id, gen,
+                    stage=STAGE_FAILED,
+                )
+
         if succeeded:
             self.log("当前题目已确认处理完成。")
         else:
             self.log("当前题目处理失败，本轮不再自动重试。")
+        self._update_state(BotState.MONITORING, "题目处理结束，继续监控课堂")
 
     @staticmethod
     def _exercise_path(page: Page) -> str:
@@ -1699,6 +1897,32 @@ class Bot:
                 if self.stop_event.wait(0.04):
                     break
 
+        if self.stop_event.is_set():
+            self.log("退出信号触发，提交确认未完成，记录为待核对状态而非成功。")
+            if self.storage and self._answer_question_id:
+                lesson_id = ""
+                try:
+                    lesson_id = self._lesson_id_from_url(page.url)
+                except Exception:
+                    pass
+                self.storage.record_stage(
+                    self.account_id, lesson_id, self._answer_question_id,
+                    self._answer_generation or self._request_generation,
+                    stage=STAGE_UNKNOWN, error_reason="关机中断待核对",
+                )
+            return False
+
+        if self.storage and self._answer_question_id:
+            lesson_id = ""
+            try:
+                lesson_id = self._lesson_id_from_url(page.url)
+            except Exception:
+                pass
+            self.storage.record_stage(
+                self.account_id, lesson_id, self._answer_question_id,
+                self._answer_generation or self._request_generation,
+                stage=STAGE_UNKNOWN, error_reason="已点击提交但超时后按钮仍存在",
+            )
         self.log("已点击提交，但提交按钮仍存在，视为未作答，本题不再自动重试。")
         return False
 

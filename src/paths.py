@@ -73,6 +73,16 @@ class PathManager:
         return self.data_dir / "debug"
 
     @property
+    def db_file(self) -> Path:
+        """SQLite 答题流水线持久化数据库。"""
+        return self.data_dir / "records.db"
+
+    @property
+    def health_file(self) -> Path:
+        """运行状态与健康检查状态文件。"""
+        return self.data_dir / "health.json"
+
+    @property
     def metrics_file(self) -> Path:
         """结构化指标记录文件。"""
         return self.data_dir / "metrics" / "quiz_timings.jsonl"
@@ -83,6 +93,7 @@ class PathManager:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.debug_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_file.parent.mkdir(parents=True, exist_ok=True)
+        self.db_file.parent.mkdir(parents=True, exist_ok=True)
 
     def resolve_resource(self, filename: str) -> Path:
         """解析只读或模板资源文件路径。

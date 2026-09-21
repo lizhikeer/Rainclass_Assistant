@@ -25,6 +25,33 @@ _log_queue: queue.Queue = queue.Queue()
 _log_listener: Optional[QueueListener] = None
 
 
+import re
+
+SENSITIVE_PATTERNS = [
+    (re.compile(r'(sessionid[=:][\s"\']*)([a-zA-Z0-9_\-]{8,})', re.IGNORECASE), r'\1***REDACTED***'),
+    (re.compile(r'(api[-_]?key[=:][\s"\']*)([^\s"\'&,;]{6,})', re.IGNORECASE), r'\1***REDACTED***'),
+    (re.compile(r'(token[=:][\s"\']*)([^\s"\'&,;]{6,})', re.IGNORECASE), r'\1***REDACTED***'),
+    (re.compile(r'(password[=:][\s"\']*)([^\s"\'&,;]+)', re.IGNORECASE), r'\1***REDACTED***'),
+    (re.compile(r'(bearer\s+)([a-zA-Z0-9_\-\.]{8,})', re.IGNORECASE), r'\1***REDACTED***'),
+    (re.compile(r'(sk-[a-zA-Z0-9]{16,})', re.IGNORECASE), r'sk-***REDACTED***'),
+]
+
+
+class SanitizingFilter(logging.Filter):
+    """日志脱敏过滤器：自动遮蔽日志记录中的敏感凭据。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+            for pattern, repl in SENSITIVE_PATTERNS:
+                message = pattern.sub(repl, message)
+            record.msg = message
+            record.args = None
+        except Exception:
+            pass
+        return True
+
+
 class _MaxLogLengthFilter(logging.Filter):
     """日志长度闸门：超长记录截断后再落盘/上屏。
 
@@ -89,6 +116,7 @@ def setup_logging(
 
     handlers: list[logging.Handler] = []
     length_gate = _MaxLogLengthFilter()
+    sanitizer = SanitizingFilter()
 
     if enable_file:
         dir_path = Path(log_dir)
@@ -103,6 +131,7 @@ def setup_logging(
         fh.namer = _bot_log_namer
         fh.setFormatter(LOG_FORMAT)
         fh.addFilter(length_gate)
+        fh.addFilter(sanitizer)
         handlers.append(fh)
 
     if enable_console:
@@ -114,6 +143,7 @@ def setup_logging(
         ch = logging.StreamHandler(sys.stdout)
         ch.setFormatter(LOG_FORMAT)
         ch.addFilter(length_gate)
+        ch.addFilter(sanitizer)
         handlers.append(ch)
 
     if extra_handlers:
