@@ -49,6 +49,11 @@ class QuizTimingTracker:
         self.timestamps: dict[str, float] = {}
         self.success: bool = False
         self.error_reason: str = ""
+        self.ai_metrics: Optional[dict[str, Any]] = None
+
+    def set_ai_metrics(self, metrics: dict[str, Any]) -> None:
+        """设置本题关联的 AI 响应策略与模型统计指标。"""
+        self.ai_metrics = metrics
 
     def mark(self, stage: str, timestamp: Optional[float] = None) -> None:
         """记录指定阶段的时间戳（单位：秒，来自 monotonic）。"""
@@ -88,6 +93,9 @@ class QuizTimingTracker:
             "error_reason": self.error_reason,
         }
 
+        if isinstance(self.ai_metrics, dict):
+            record["ai_metrics"] = self.ai_metrics
+
         # 追加写入 metrics 文件（同步单行追加，不影响热路径高频落盘）
         if self.metrics_file:
             try:
@@ -105,6 +113,14 @@ class QuizTimingTracker:
             f"确认提交: {durations_ms.get('clicked_to_confirmed_ms', '-')}ms",
             f"端到端总计: {durations_ms.get('total_end_to_end_ms', '-')}ms",
         ]
+        if isinstance(self.ai_metrics, dict):
+            strat = str(self.ai_metrics.get("strategy", "-"))
+            winner = str(self.ai_metrics.get("winning_model", "-"))
+            try:
+                vrate = float(self.ai_metrics.get("valid_rate", 0.0) or 0.0)
+                summary_items.append(f"AI策略: {strat}({winner}, 有效比:{int(vrate*100)}%)")
+            except (TypeError, ValueError):
+                summary_items.append(f"AI策略: {strat}({winner})")
         logger.info(
             "[TIMING] 题目 %s 耗时 (来源: %s, 成功: %s): %s",
             record["question_id"],

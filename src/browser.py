@@ -418,3 +418,13 @@ class BrowserManager:
             except Exception:
                 return {}
         return {}
+
+    def get_all_cookies(self) -> list[dict]:
+        """返回当前上下文完整的 cookies 列表（含 domain, path, secure 等属性）。"""
+        if self._context and self.is_running:
+            try:
+                return list(self._context.cookies())
+            except Exception:
+                return []
+        return []
+

@@ -23,6 +23,20 @@ import requests
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
+from src.ai.image import download_question_image
+from src.ai.models import (
+    EndpointConfig,
+    ModelCallResult,
+    RoundDecision,
+    canonical_vote,
+    extract_answer_json,
+    is_failed_text,
+    is_submittable_vote,
+    vote_letters,
+    vote_to_answer,
+)
+from src.ai.strategy import StrategyRunner
+
 logger = logging.getLogger(__name__)
 
 # 压缩模型报错
@@ -83,6 +97,10 @@ class AIService:
         self._request_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="ai-request"
         )
+        max_concurrent = int(self.config.get("ai_max_concurrent_requests", 4))
+        self.runner = StrategyRunner(max_workers=max_concurrent)
+        self.last_decision: Optional[RoundDecision] = None
+        self._current_generation = 0
         self._last_cleanup = 0.0
         self._closed = False
 
@@ -136,23 +154,12 @@ class AIService:
         cookies: Optional[dict] = None,
         timeout: float = 10,
     ) -> Tuple[bytes, str]:
-        """下载图片并保存到 data/YYYY-MM-DD/HH-MM-SS.png。返回 (bytes, 路径)。
+        """安全下载图片并保存到 data/YYYY-MM-DD/HH-MM-SS.png。返回 (bytes, 路径)。
 
-        cookies：可选，用于带鉴权下载（雨课堂题图可能需要登录态）。
+        cookies：可选，用于带鉴权下载（自动按域名/Path/Secure 过滤与隔离重定向）。
         """
-        response = requests.get(image_url, timeout=timeout, cookies=cookies)
-        response.raise_for_status()
-        image_bytes = response.content
+        image_bytes, filepath = download_question_image(image_url, cookies=cookies, timeout=timeout)
 
-        now = datetime.now()
-        data_dir = os.path.join("data", now.strftime("%Y-%m-%d"))
-        os.makedirs(data_dir, exist_ok=True)
-        filepath = os.path.join(data_dir, f"{now.strftime('%H-%M-%S-%f')}.png")
-
-        with open(filepath, "wb") as f:
-            f.write(image_bytes)
-
-        logger.info(f"题目截图已保存：{filepath}")
         # 定时清理旧截图，避免每次下载都全盘遍历
         now_ts = time.time()
         if now_ts - self._last_cleanup > 3600:
@@ -219,6 +226,8 @@ class AIService:
             return
         self._closed = True
         self._request_executor.shutdown(wait=False, cancel_futures=True)
+        if hasattr(self, "runner"):
+            self.runner.shutdown()
         logger.debug("AI 服务线程池已关闭。")
 
     # ==================== 手动截断 / 进度 ====================
@@ -282,12 +291,172 @@ class AIService:
             self._multi_status["valid"] = valid
             self._multi_status["truncated"] = truncated
 
+    def _resolve_endpoint(self, model_name: str) -> EndpointConfig:
+        """根据模型名称解析为对应的 EndpointConfig。"""
+        name = (model_name or "").strip()
+        if name == "豆包AI":
+            return EndpointConfig(
+                name="豆包AI",
+                base_url="https://ark.cn-beijing.volces.com/api/v3",
+                api_key=self.config.get("doubao_api_key", ""),
+                model="doubao-seed-1-6-250615",
+                timeout=15.0,
+                extra_body={"enable_thinking": False},
+            )
+        elif name == "Gemini AI":
+            return EndpointConfig(
+                name="Gemini AI",
+                base_url="https://generativelanguage.googleapis.com/v1beta",
+                api_key=self.config.get("gemini_api_key", ""),
+                model="gemini-2.5-flash",
+                timeout=15.0,
+                provider_type="gemini",
+            )
+        elif name == "自定义":
+            return EndpointConfig(
+                name="自定义",
+                base_url=self.config.get("custom_ai_base_url", "").strip(),
+                api_key=self.config.get("custom_ai_api_key", "").strip(),
+                model=self.config.get("custom_ai_model", "").strip(),
+                timeout=15.0,
+                extra_body={"enable_thinking": False},
+            )
+        else:
+            for ep in self._load_multi_ai_endpoints():
+                if ep.name == name:
+                    return EndpointConfig(
+                        name=ep.name,
+                        base_url=ep.base_url,
+                        api_key=ep.api_key,
+                        model=ep.model,
+                        timeout=self._multi_ai_timeout(),
+                        description=ep.description,
+                    )
+            return EndpointConfig(
+                name=name or "自定义",
+                base_url=self.config.get("custom_ai_base_url", "").strip(),
+                api_key=self.config.get("custom_ai_api_key", "").strip(),
+                model=name or self.config.get("custom_ai_model", "").strip(),
+                timeout=15.0,
+            )
+
+    def _load_strategy_endpoints(self) -> list[EndpointConfig]:
+        """为 consensus 策略加载候选模型端点列表。"""
+        multi_eps = self._load_multi_ai_endpoints()
+        if multi_eps:
+            return [
+                EndpointConfig(
+                    name=ep.name,
+                    base_url=ep.base_url,
+                    api_key=ep.api_key,
+                    model=ep.model,
+                    timeout=self._multi_ai_timeout(),
+                    description=ep.description,
+                )
+                for ep in multi_eps
+            ]
+        res = []
+        p_name = self.config.get("ai_primary_model", self.config.get("ai_model", "豆包AI"))
+        res.append(self._resolve_endpoint(p_name))
+        b_name = self.config.get("ai_backup_model", "")
+        if b_name and b_name != p_name:
+            res.append(self._resolve_endpoint(b_name))
+        return res
+
+    def _execute_strategy_round(
+        self,
+        *,
+        image_url: Optional[str] = None,
+        image_b64: Optional[str] = None,
+        cookies: Optional[dict] = None,
+        deadline: Optional[float] = None,
+        generation: int = 0,
+    ) -> str:
+        """根据当前配置的 AI 响应策略协调单次或多次模型调用并作出决策。"""
+        self._current_generation = generation
+        timeout = float(self.config.get("ai_total_budget_seconds", 20.0))
+        calc_deadline = (time.monotonic() + timeout) if deadline is None else deadline
+
+        mime_type = "image/png"
+        if not image_b64 and image_url:
+            try:
+                rem_download = max(0.1, min(10.0, calc_deadline - time.monotonic()))
+                image_bytes, _ = self._download_and_save(image_url, cookies=cookies, timeout=rem_download)
+                image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+                mime_type = self._guess_mime(image_bytes)
+            except Exception as exc:
+                logger.error("题图下载失败：%s", exc)
+                return f"图片下载失败（调用失败）：{exc}"
+
+        if not image_b64:
+            return "AI调用失败：无题目图片数据"
+
+        if time.monotonic() >= calc_deadline:
+            return "AI调用失败：准备题图已超过整体预算截止时间。"
+
+        strategy = self.config.get("ai_strategy", "fast_single")
+        margin = float(self.config.get("submit_time_margin_seconds", 3.0))
+
+        if strategy == "race_first_valid":
+            primary_name = self.config.get("ai_primary_model", self.config.get("ai_model", "豆包AI"))
+            primary = self._resolve_endpoint(primary_name)
+            backup_name = self.config.get("ai_backup_model", "")
+            backup = self._resolve_endpoint(backup_name) if backup_name else None
+            delay_ms = int(self.config.get("ai_backup_delay_ms", 0))
+            decision = self.runner.execute_race_first_valid(
+                primary_endpoint=primary,
+                backup_endpoint=backup,
+                image_b64=image_b64,
+                prompt=PROMPT_ANSWER,
+                deadline=calc_deadline,
+                backup_delay_ms=delay_ms,
+                margin_seconds=margin,
+                mime_type=mime_type,
+                check_cancelled=lambda: self._current_generation != generation or self._closed,
+            )
+        elif strategy == "consensus":
+            endpoints = self._load_strategy_endpoints()
+            quorum = int(self.config.get("ai_consensus_quorum", 2))
+            mode = self.config.get("ai_consensus_mode", "quorum")
+            tie_breaker = self.config.get("ai_consensus_tie_breaker", "priority")
+            decision = self.runner.execute_consensus(
+                endpoints=endpoints,
+                image_b64=image_b64,
+                prompt=PROMPT_ANSWER,
+                deadline=calc_deadline,
+                quorum=quorum,
+                mode=mode,
+                tie_breaker=tie_breaker,
+                mime_type=mime_type,
+                check_cancelled=lambda: self._current_generation != generation or self._closed,
+            )
+        else:
+            primary_name = self.config.get("ai_primary_model", self.config.get("ai_model", "豆包AI"))
+            primary = self._resolve_endpoint(primary_name)
+            backup_name = self.config.get("ai_backup_model", "")
+            backup = self._resolve_endpoint(backup_name) if backup_name else None
+            decision = self.runner.execute_fast_single(
+                primary_endpoint=primary,
+                backup_endpoint=backup,
+                image_b64=image_b64,
+                prompt=PROMPT_ANSWER,
+                deadline=calc_deadline,
+                margin_seconds=margin,
+                mime_type=mime_type,
+                check_cancelled=lambda: self._current_generation != generation or self._closed,
+            )
+
+        self.last_decision = decision
+        return decision.winning_answer
+
     def submit_answer(
         self,
         *,
         image_url: Optional[str] = None,
         image_b64: Optional[str] = None,
         cookies: Optional[dict] = None,
+        deadline: Optional[float] = None,
+        generation: int = 0,
     ) -> Future[str]:
         """异步提交答题请求；调用方负责在页面线程中处理返回结果。"""
         if self._closed:
@@ -298,11 +467,18 @@ class AIService:
             if image_b64:
                 return self._start_daemon_request(self.answer_from_image, image_b64)
             raise ValueError("答题请求缺少图片数据")
-        if image_url:
-            return self._request_executor.submit(self.get_answer, image_url, cookies)
-        if image_b64:
-            return self._request_executor.submit(self.answer_from_image, image_b64)
-        raise ValueError("答题请求缺少图片数据")
+
+        if not image_url and not image_b64:
+            raise ValueError("答题请求缺少图片数据")
+
+        return self._request_executor.submit(
+            self._execute_strategy_round,
+            image_url=image_url,
+            image_b64=image_b64,
+            cookies=cookies,
+            deadline=deadline,
+            generation=generation,
+        )
 
     @staticmethod
     def _start_daemon_request(

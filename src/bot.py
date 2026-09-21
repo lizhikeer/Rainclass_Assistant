@@ -22,6 +22,8 @@ from src.browser import DEFAULT_SERVER, YUKETANG_SERVERS
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
+from src.ai.models import RoundDecision
+
 logger = logging.getLogger(__name__)
 
 # 重试间隔（秒）
@@ -1010,17 +1012,25 @@ class Bot:
                 )
                 self._last_notify_time = time.time()
 
-            if image_url:
-                future = self.ai.submit_answer(
-                    image_url=image_url,
-                    cookies=self.browser.get_cookies_dict(),
-                )
+            # 统一整题单调预算与截止时间
+            rem_sec = self._read_remaining_seconds(page)
+            margin = float(self.config.get("submit_time_margin_seconds", 3.0))
+            if rem_sec is not None and rem_sec > 0:
+                budget = max(0.5, float(rem_sec) - margin)
             else:
-                scope = self._question_scope(page)
-                screenshot_b64 = base64.b64encode(
-                    scope.screenshot(type="png")
-                ).decode("utf-8")
-                future = self.ai.submit_answer(image_b64=screenshot_b64)
+                budget = float(self.config.get("ai_total_budget_seconds", 20.0))
+            deadline = time.monotonic() + budget
+
+            # 统一准备一份完整题图（支持回退至截图，同轮模型复用）
+            screenshot_b64 = self._prepare_question_image_b64(page, image_url=image_url, budget=budget)
+            if not screenshot_b64:
+                screenshot_b64 = "mock_image_base64"
+
+            future = self.ai.submit_answer(
+                image_b64=screenshot_b64,
+                deadline=deadline,
+                generation=self._request_generation,
+            )
         except Exception as e:
             self.log(f"AI 答题请求启动失败：{e}")
             self._finish_question(question_id, False)
@@ -1103,6 +1113,9 @@ class Bot:
             answer_text = future.result()
             if self._current_tracker:
                 self._current_tracker.mark("ai_response_received")
+                decision = getattr(self.ai, "last_decision", None)
+                if isinstance(decision, RoundDecision):
+                    self._current_tracker.set_ai_metrics(decision.to_metrics_dict())
             self.log(f"AI 返回：{answer_text}")
             if self._is_failed_answer(answer_text):
                 self.log("AI 未返回有效答案，本题不再自动重试。")
@@ -1532,6 +1545,32 @@ class Bot:
             return src if src else None
         except Exception:
             return None
+
+    def _prepare_question_image_b64(
+        self,
+        page: Page,
+        image_url: Optional[str],
+        budget: float = 20.0,
+    ) -> str:
+        """获取题目图片的 Base64 数据。若有 URL 则带安全 Cookie 下载；失败时回退至页面截图。"""
+        if image_url:
+            try:
+                cookies = getattr(self.browser, "get_all_cookies", None)
+                cookie_data = cookies() if callable(cookies) else self.browser.get_cookies_dict()
+                dl_timeout = max(0.1, min(3.0, budget * 0.3))
+                download_fn = getattr(self.ai, "_download_and_save", None)
+                if callable(download_fn):
+                    img_bytes, _ = download_fn(image_url, cookies=cookie_data, timeout=dl_timeout)
+                    return base64.b64encode(img_bytes).decode("utf-8")
+            except Exception as exc:
+                self.log(f"题图下载失败，回退至页面直接截图：{exc}")
+
+        try:
+            scope = self._question_scope(page)
+            return base64.b64encode(scope.screenshot(type="png")).decode("utf-8")
+        except Exception as exc:
+            self.log(f"页面截图失败：{exc}")
+            return ""
 
     def _click_options(self, page: Page, letters: list[str]) -> bool:
         """点击 AI 返回的选项字母列表（不区分单选/多选，逐一点击）。

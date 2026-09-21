@@ -63,6 +63,43 @@ class ConfigPersistenceTests(unittest.TestCase):
             self.assertTrue(config.persist())
             self.assertEqual(Config(path).get("last_cookie_warn_date"), "2026-09-01")
 
+    def test_ai_strategy_defaults_and_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(os.path.join(directory, "config.json"))
+            settings = config.to_dict()
+
+            # 验证默认值
+            self.assertEqual(settings["ai_strategy"], "fast_single")
+            self.assertEqual(settings["ai_primary_model"], "豆包AI")
+            self.assertEqual(settings["ai_consensus_quorum"], 2)
+            self.assertEqual(settings["ai_total_budget_seconds"], 20.0)
+            self.assertEqual(settings["submit_time_margin_seconds"], 3.0)
+            self.assertEqual(settings["ai_max_concurrent_requests"], 4)
+
+            # 策略名称非法
+            settings["ai_strategy"] = "invalid_strategy"
+            self.assertIn("ai_strategy 必须是 fast_single / race_first_valid / consensus", config.save(settings))
+
+            # consensus 模式非法
+            settings["ai_strategy"] = "consensus"
+            settings["ai_consensus_mode"] = "majority_invalid"
+            self.assertIn("ai_consensus_mode 必须是 quorum 或 strict_majority", config.save(settings))
+
+            # 平票策略非法
+            settings["ai_consensus_mode"] = "quorum"
+            settings["ai_consensus_tie_breaker"] = "random"
+            self.assertIn("ai_consensus_tie_breaker 必须是 priority 或 skip", config.save(settings))
+
+            # 数值越界
+            settings["ai_consensus_tie_breaker"] = "priority"
+            settings["ai_backup_delay_ms"] = 999999
+            self.assertIn("ai_backup_delay_ms 范围应为 0~60000", config.save(settings))
+
+            # 合法配置保存成功
+            settings["ai_backup_delay_ms"] = 500
+            self.assertEqual(config.save(settings), [])
+            self.assertEqual(config.get("ai_backup_delay_ms"), 500)
+
 
 if __name__ == "__main__":
     unittest.main()

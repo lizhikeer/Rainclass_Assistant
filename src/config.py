@@ -65,6 +65,16 @@ DEFAULTS: dict[str, Any] = {
     "quiz_refresh_interval": 1,
     "classroom_poll_interval_ms": 200,  # 课堂内高频检测间隔（毫秒），优先于 quiz_refresh_interval
     "save_exercise_html": False,  # 是否保存每题完整 HTML（默认关闭，诊断按需开启）
+    "ai_strategy": "fast_single",  # AI 响应策略：fast_single（默认单模型）/ race_first_valid（双模型竞速）/ consensus（多模型共识）
+    "ai_primary_model": "豆包AI",  # 主模型名称（豆包AI / Gemini AI / 自定义 / 或 model_visible.ini 中的节点名）
+    "ai_backup_model": "",  # 备用模型名称（为空表示无备用模型）
+    "ai_backup_delay_ms": 0,  # race_first_valid 备用模型启动延迟（毫秒），0 表示同时启动
+    "ai_consensus_quorum": 2,  # consensus 策略 quorum 阈值（收到指定数量相同有效答案立即提前决策）
+    "ai_consensus_mode": "quorum",  # consensus 决策模式：quorum（达到法定票数）/ strict_majority（严格多数）
+    "ai_consensus_tie_breaker": "priority",  # consensus 超时/平票策略：priority（按配置优先级）/ skip（跳过）
+    "ai_total_budget_seconds": 20.0,  # 题目无有效倒计时时的整题 AI 预算（秒）
+    "submit_time_margin_seconds": 3.0,  # 倒计时安全余量（秒），用于选项操作和提交确认
+    "ai_max_concurrent_requests": 4,  # AI 在途请求最大并发数
     "xxtui_api_key": "",
     "last_cookie_warn_date": "",
     "last_cookie_update_time": "",
@@ -189,6 +199,22 @@ class Config:
             if key in settings and not isinstance(settings.get(key), bool):
                 errors.append(f"{key} 必须是布尔值（true/false）")
 
+        # AI 策略校验
+        if "ai_strategy" in settings:
+            strat = settings.get("ai_strategy")
+            if strat not in ("fast_single", "race_first_valid", "consensus"):
+                errors.append("ai_strategy 必须是 fast_single / race_first_valid / consensus")
+
+        if "ai_consensus_mode" in settings:
+            cmode = settings.get("ai_consensus_mode")
+            if cmode not in ("quorum", "strict_majority"):
+                errors.append("ai_consensus_mode 必须是 quorum 或 strict_majority")
+
+        if "ai_consensus_tie_breaker" in settings:
+            tbreak = settings.get("ai_consensus_tie_breaker")
+            if tbreak not in ("priority", "skip"):
+                errors.append("ai_consensus_tie_breaker 必须是 priority 或 skip")
+
         # 数值范围校验
         int_fields = {
             "submit_delay": (0, 300),
@@ -197,16 +223,35 @@ class Config:
             "classroom_poll_interval_ms": (50, 5000),
             "multi_ai_timeout": (1, 300),
             "auto_truncate_seconds": (0, 3600),
+            "ai_backup_delay_ms": (0, 60000),
+            "ai_consensus_quorum": (1, 20),
+            "ai_max_concurrent_requests": (1, 32),
         }
         for key, (lo, hi) in int_fields.items():
-            val = settings.get(key)
-            try:
-                val = int(val)
-            except (ValueError, TypeError):
-                errors.append(f"{key} 必须是数字")
-                continue
-            if not (lo <= val <= hi):
-                errors.append(f"{key} 范围应为 {lo}~{hi}")
+            if key in settings:
+                val = settings.get(key)
+                try:
+                    val = int(val)
+                except (ValueError, TypeError):
+                    errors.append(f"{key} 必须是数字")
+                    continue
+                if not (lo <= val <= hi):
+                    errors.append(f"{key} 范围应为 {lo}~{hi}")
+
+        float_fields = {
+            "ai_total_budget_seconds": (1.0, 300.0),
+            "submit_time_margin_seconds": (0.0, 60.0),
+        }
+        for key, (lo, hi) in float_fields.items():
+            if key in settings:
+                val = settings.get(key)
+                try:
+                    val = float(val)
+                except (ValueError, TypeError):
+                    errors.append(f"{key} 必须是数字")
+                    continue
+                if not (lo <= val <= hi):
+                    errors.append(f"{key} 范围应为 {lo}~{hi}")
 
         return errors
 
