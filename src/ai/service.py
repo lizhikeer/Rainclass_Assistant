@@ -75,7 +75,7 @@ TEST_PROMPT = "用十六个字以内描述该图片"
 TEST_IMAGE_PATH = "test_pic.png"
 
 
-NO_THINKING_EXTRA_BODY = {"enable_thinking": False}
+NO_THINKING_EXTRA_BODY = {"enable_thinking": False, "thinking": {"type": "disabled"}}
 
 
 @dataclass(frozen=True)
@@ -319,7 +319,7 @@ class AIService:
                 api_key=self.config.get("custom_ai_api_key", "").strip(),
                 model=self.config.get("custom_ai_model", "").strip(),
                 timeout=15.0,
-                extra_body={"enable_thinking": False},
+                extra_body=NO_THINKING_EXTRA_BODY,
             )
         else:
             for ep in self._load_multi_ai_endpoints():
@@ -331,6 +331,7 @@ class AIService:
                         model=ep.model,
                         timeout=self._multi_ai_timeout(),
                         description=ep.description,
+                        extra_body=NO_THINKING_EXTRA_BODY,
                     )
             return EndpointConfig(
                 name=name or "自定义",
@@ -338,6 +339,7 @@ class AIService:
                 api_key=self.config.get("custom_ai_api_key", "").strip(),
                 model=name or self.config.get("custom_ai_model", "").strip(),
                 timeout=15.0,
+                extra_body=NO_THINKING_EXTRA_BODY,
             )
 
     def _load_strategy_endpoints(self) -> list[EndpointConfig]:

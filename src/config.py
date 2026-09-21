@@ -99,6 +99,8 @@ class Config:
         "doubao_api_key": "DOUBAO_API_KEY",
         "gemini_api_key": "GEMINI_API_KEY",
         "custom_ai_api_key": "CUSTOM_AI_API_KEY",
+        "custom_ai_base_url": "CUSTOM_AI_BASE_URL",
+        "custom_ai_model": "CUSTOM_AI_MODEL",
         "xxtui_api_key": "XXTUI_API_KEY",
     }
 

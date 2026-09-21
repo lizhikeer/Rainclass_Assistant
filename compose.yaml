@@ -1,0 +1,38 @@
+services:
+  rainclass-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-python:3.11-slim}
+    image: rainclass-assistant:latest
+    container_name: rainclass-worker
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    shm_size: "1gb"
+    user: "${APP_UID:-1000}:${APP_GID:-1001}"
+    environment:
+      - TZ=Asia/Shanghai
+      - WORKER_MODE=${WORKER_MODE:-observe}
+      - RAINCLASS_MODE=${WORKER_MODE:-observe}
+      - RAINCLASS_DATA_DIR=/app/data
+    volumes:
+      - ${NAS_DATA_DIR:-./data}:/app/data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.worker", "--data-dir", "/app/data", "--healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: ["--data-dir", "/app/data", "--wait-for-session"]

@@ -241,7 +241,14 @@ def run_worker(args: Optional[argparse.Namespace] = None) -> int:
         print(f"配置错误：\n{err}", file=sys.stderr)
         return EXIT_ERROR
 
-    server_name = config.get("yuketang_server", DEFAULT_SERVER)
+    server_name = config.get("yuketang_server")
+    classroom_url = config.get("classroom_url", "")
+    if not server_name or server_name == DEFAULT_SERVER:
+        for s_name, s_url in YUKETANG_SERVERS.items():
+            if s_url in classroom_url:
+                server_name = s_name
+                break
+    server_name = server_name or DEFAULT_SERVER
     base_url = YUKETANG_SERVERS.get(server_name, YUKETANG_SERVERS[DEFAULT_SERVER])
 
     # 优先处理会话导入命令
@@ -269,10 +276,12 @@ def run_worker(args: Optional[argparse.Namespace] = None) -> int:
     # 强制固定后台为无头模式
     config.set("headless_mode", True)
 
-    # 命令行指定模式优先
-    effective_mode = args.mode or config.get("mode", "observe")
+    # 运行模式解析：命令行参数 > 环境变量 (RAINCLASS_MODE / WORKER_MODE) > 配置文件 > 默认 observe
+    env_mode = (os.getenv("RAINCLASS_MODE") or os.getenv("WORKER_MODE") or "").strip().lower()
+    valid_env_mode = env_mode if env_mode in ("observe", "auto") else None
+    effective_mode = getattr(args, "mode", None) or valid_env_mode or config.get("mode", "observe")
     config.set("mode", effective_mode)
-    logger.info("运行模式: %s", effective_mode)
+    logger.info("运行模式: %s (来源: %s)", effective_mode, "命令行" if getattr(args, "mode", None) else ("环境变量" if valid_env_mode else "配置文件"))
 
     # 单实例锁保护（按数据目录隔离不同实例）
     lock = InstanceLock(paths.lock_file)

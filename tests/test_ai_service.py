@@ -69,7 +69,7 @@ class AIServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             client.chat.completions.create.call_args.kwargs["extra_body"],
-            {"enable_thinking": False},
+            {"enable_thinking": False, "thinking": {"type": "disabled"}},
         )
 
     def test_prompt_allows_models_to_report_missing_vision(self):
@@ -136,7 +136,10 @@ model = second-model
         request = client.chat.completions.create.call_args.kwargs
         image_url = request["messages"][0]["content"][0]["image_url"]["url"]
         self.assertTrue(image_url.startswith("data:image/jpeg;base64,"))
-        self.assertEqual(request["extra_body"], {"enable_thinking": False})
+        self.assertEqual(
+            request["extra_body"],
+            {"enable_thinking": False, "thinking": {"type": "disabled"}},
+        )
         client.close.assert_called_once()
 
     def test_doubao_request_disables_thinking(self):
@@ -159,7 +162,7 @@ model = second-model
 
         self.assertEqual(
             client.chat.completions.create.call_args.kwargs["extra_body"],
-            {"enable_thinking": False},
+            {"enable_thinking": False, "thinking": {"type": "disabled"}},
         )
 
     def test_gemini_request_disables_thinking(self):

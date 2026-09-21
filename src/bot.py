@@ -426,7 +426,14 @@ class Bot:
 
     def _server_host(self) -> str:
         """所配雨课堂服务器的主机名（小写），用于首页/课堂判定。"""
-        name = self.config.get("yuketang_server", DEFAULT_SERVER)
+        name = self.config.get("yuketang_server")
+        classroom_url = self.config.get("classroom_url", "")
+        if not name or name == DEFAULT_SERVER:
+            for s_name, s_url in YUKETANG_SERVERS.items():
+                if s_url in classroom_url:
+                    name = s_name
+                    break
+        name = name or DEFAULT_SERVER
         return urlsplit(
             YUKETANG_SERVERS.get(name, YUKETANG_SERVERS[DEFAULT_SERVER])
         ).netloc.lower()

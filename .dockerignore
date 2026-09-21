@@ -1,0 +1,45 @@
+# Version control
+.git
+.gitignore
+
+# Virtual environment & python cache
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local environment variables & secrets (CRITICAL: DO NOT LEAK INTO IMAGE)
+.env
+*.env
+config.json
+browser_state.json
+cookies.txt
+.rainclass-assistant.lock
+model_visible.ini
+
+# Runtime data, records, logs, debug artifacts
+data/
+debug/
+log/
+*.log
+*.log.*
+records.db*
+health.json
+soak_report.json
+
+# Test data & scratch
+scratch/
+scratch_test_data/
+testQuestion/
+Original/
+docx/
+*.md.bak
+*.png
+
+# IDE configs
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
