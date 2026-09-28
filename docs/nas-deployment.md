@@ -221,3 +221,88 @@ git checkout feature/stage-04-long-run-and-recovery
 docker compose build
 docker compose up -d
 ```
+
+---
+
+## 7. 双容器 Web 管理面板与 Caddy HTTPS 网关部署 (Stage 7 HDU 风格面板)
+
+在阶段 7 中，系统升级支持 HDU-grabber 风格暗黑 Web 管理面板（主色调 `#0f1419`），通过 Caddy 反向代理对外暴露安全 HTTPS 访问端口（`:40010`），内建 HTTP Basic Auth 访问认证与 SSE 实时脱敏日志流。
+
+### 7.1 架构与端口规划
+
+```text
+       [浏览器/移动端] 
+             │ HTTPS :40010 (Basic Auth: LzK / LzK)
+             ▼
+    ┌──────────────────────────────────────────────┐
+    │  rainclass-caddy (Caddy 2 官方镜像)           │
+    │  - 端口: 40010 -> 8000                        │
+    │  - 证书: /certs 真实证书或 internal 自签名     │
+    │  - SSE 禁用缓冲: flush_interval -1            │
+    └──────────────────────┬───────────────────────┘
+                           │ 内网 HTTP (rainclass-app:8000)
+    ┌──────────────────────▼───────────────────────┐
+    │  rainclass-app (FastAPI Web Panel + Worker)  │
+    │  - Web 静态资源 (HDU 暗黑控制台)              │
+    │  - RESTful API (状态/控制/配置/记录/日志)     │
+    │  - 单实例 Worker 子进程生命周期守护           │
+    │  - 持久化挂载: ./data -> /app/data           │
+    └──────────────────────────────────────────────┘
+```
+
+### 7.2 环境变量配置 (`.env`)
+
+在 `.env` 中按需指定 Caddy 证书路径与指令：
+
+```ini
+# 宿主用户映射（飞牛 NAS 默认 lzk 用户为 1000:1001）
+APP_UID=1000
+APP_GID=1001
+
+# 基础镜像与运行模式
+BASE_IMAGE=python:3.11-slim-bookworm
+WORKER_MODE=observe
+
+# 宿主机持久化数据目录路径
+NAS_DATA_DIR=./data
+
+# Caddy HTTPS 证书映射（飞牛 NAS 证书目录，若未配置证书则使用 internal 自签）
+NAS_CERTS_DIR=/vol4/docker/xray/certs
+# 若使用已有域名证书：
+# CADDY_TLS_DIRECTIVE="tls /certs/91666.icu.crt /certs/91666.icu.key"
+# 若使用 Caddy 内部自签（默认）：
+CADDY_TLS_DIRECTIVE="tls internal"
+```
+
+### 7.3 编排启动与管理
+
+```bash
+# 1. 使用面板专用编排文件启动双容器服务
+docker compose -f compose.panel.yaml up -d --build
+
+# 2. 查看双容器运行状态
+docker compose -f compose.panel.yaml ps
+
+# 3. 跟踪查看网关与应用日志
+docker compose -f compose.panel.yaml logs -f
+```
+
+### 7.4 访问与安全凭据
+
+- **访问地址**：`https://<NAS_IP_OR_DOMAIN>:40010`（如 `https://91666.icu:40010`）
+- **Basic Auth 账号**：`LzK`
+- **Basic Auth 密码**：`LzK`
+- **安全说明**：
+  - Basic Auth 密码在 Caddyfile 中存储为标准 bcrypt 哈希（`$2b$10$...`）；
+  - Web API 严禁对外暴露真实 API Key 与 Cookie 内容（自动 `sk-***` 掩码脱敏）；
+  - 不挂载 Docker Socket，无远程任意代码执行风险；
+  - Worker 作为内部托管单进程运行，避免双开写竞态。
+
+### 7.5 从单容器 Worker 平滑迁移到双容器面板
+
+1. 保持现有 `./data` 目录完全不变（包含已有 `config.json`、`browser_state.json` 与 `records.db`）；
+2. 停止原单容器 Worker：`docker compose down`；
+3. 启动双容器面板：`docker compose -f compose.panel.yaml up -d --build`；
+4. 浏览器访问 `https://YOUR_NAS_IP:40010`，通过面板即时查看运行状态、切换模式、或在线导入新凭据；
+5. 若需回滚单容器，仅需 `docker compose -f compose.panel.yaml down` 并 `docker compose up -d` 即可秒级切回。
+

@@ -1,0 +1,63 @@
+services:
+  rainclass-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-python:3.11-slim-bookworm}
+    image: rainclass-assistant:panel
+    container_name: rainclass-app
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    shm_size: "1gb"
+    user: "${APP_UID:-1000}:${APP_GID:-1001}"
+    entrypoint: ["python", "-m", "uvicorn", "src.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      - TZ=Asia/Shanghai
+      - DATA_DIR=/app/data
+      - WORKER_MODE=${WORKER_MODE:-observe}
+      - RAINCLASS_MODE=${WORKER_MODE:-observe}
+    volumes:
+      - ${NAS_DATA_DIR:-./data}:/app/data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/api/health\")' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  rainclass-caddy:
+    image: caddy:2-alpine
+    container_name: rainclass-caddy
+    restart: unless-stopped
+    ports:
+      - "40010:40010"
+    environment:
+      - CADDY_TLS_DIRECTIVE=${CADDY_TLS_DIRECTIVE:-tls internal}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${NAS_CERTS_DIR:-/vol4/docker/xray/certs}:/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - rainclass-app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:

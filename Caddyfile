@@ -1,0 +1,24 @@
+{
+    admin off
+}
+
+:40010 {
+    # 证书配置：默认使用 internal 自签名证书，NAS 环境通过环境变量注入真实证书
+    {$CADDY_TLS_DIRECTIVE:tls internal}
+
+    # 用户鉴权：用户名 LzK，密码 LzK (bcrypt hash)
+    basic_auth {
+        LzK $2b$10$NjDI9hhhcVToB0zuAiJJbe3PsItLWCMZcifW6TOv/0PDi0dWpvo4u
+    }
+
+    # 反向代理至管理服务与 SSE 日志流
+    reverse_proxy rainclass-app:8000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # 禁用缓冲区以保障 SSE 流式推送即时性
+        flush_interval -1
+    }
+}

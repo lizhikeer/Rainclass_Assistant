@@ -152,7 +152,10 @@ class Config:
 
     def save(self, settings: dict[str, Any]) -> list[str]:
         """保存配置到文件，返回校验错误列表（空列表表示成功）。"""
-        errors = self._validate(settings)
+        with self._lock:
+            merged = dict(self._data)
+        merged.update(settings)
+        errors = self._validate(merged)
         if errors:
             return errors
 
