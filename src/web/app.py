@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from src.ai.models import EndpointConfig
 from src.ai.service import AIService
 from src.config import Config, DEFAULTS
+from src.web.login_manager import QRLoginManager
 from src.web.manager import ProcessManager, sanitize_text
 
 
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 # 获取数据目录
 DATA_DIR = os.getenv("DATA_DIR", "data")
 manager = ProcessManager(DATA_DIR)
+login_manager = QRLoginManager(DATA_DIR, manager, manager.log_buffer)
 
 app = FastAPI(
     title="Rainclass Assistant Web Panel",
@@ -35,6 +37,8 @@ app = FastAPI(
     docs_url=None,  # 生产环境隐藏文档以防探测
     redoc_url=None,
 )
+app.state.manager = manager
+app.state.login_manager = login_manager
 
 # 敏感字段列表
 SENSITIVE_CONFIG_KEYS = {
@@ -287,6 +291,54 @@ async def test_ai_connectivity(request: Request):
         }
     finally:
         service.shutdown()
+
+
+# ==================== 网页扫码登录 API ====================
+
+class QRStartRequest(BaseModel):
+    server: Optional[str] = "雨课堂"
+
+
+@app.post("/api/login/qr/start")
+async def start_qr_login(req: QRStartRequest, response: Response):
+    """启动网页扫码登录会话。"""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    lm = getattr(app.state, "login_manager", login_manager)
+    server = req.server or "雨课堂"
+    ok, msg, data = lm.start_login(server)
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"success": True, "message": msg, "data": data}
+
+
+@app.get("/api/login/qr/status")
+async def get_qr_status(response: Response):
+    """获取当前扫码登录状态与临时二维码图片数据。"""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    lm = getattr(app.state, "login_manager", login_manager)
+    return lm.get_status()
+
+
+@app.post("/api/login/qr/refresh")
+async def refresh_qr_code(response: Response):
+    """刷新二维码。"""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    lm = getattr(app.state, "login_manager", login_manager)
+    ok, msg = lm.refresh_qr()
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"success": True, "message": msg}
+
+
+@app.post("/api/login/qr/cancel")
+async def cancel_qr_login(response: Response):
+    """取消扫码登录流程。"""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    lm = getattr(app.state, "login_manager", login_manager)
+    ok, msg = lm.cancel_login()
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"success": True, "message": msg}
 
 
 # ==================== 静态文件分发 ====================

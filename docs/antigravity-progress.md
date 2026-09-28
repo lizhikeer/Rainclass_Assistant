@@ -2,10 +2,10 @@
 
 ## 1. 阶段概述
 
-- **当前完成阶段**：第七阶段：HDU 风格 Web 管理面板与 Caddy HTTPS 网关（`07-面板与网关`）
-- **当前代码分支**：`feature/stage-07-hdu-style-panel-and-caddy`
-- **基线提交**：`c0a4291` (stage 6 complete)
-- **交付状态**：已完成 HDU-grabber 风格暗黑管理面板全栈实现（纯净 HTML5/CSS/ES6、后端 FastAPI、单实例 Worker 托管与进程生命周期控制、安全脱敏日志流推、原子凭证导入、答题审计可视化）；配置 Caddy 反向代理网关（`:40010`，Basic Auth `LzK` / `LzK`，SSE 零缓冲直推）；双容器编排文件 `compose.panel.yaml`；通过新增 Manager、API 与 Playwright 真实 UI 渲染自动化测试（189/189 测试全部通过）；已就绪进入阶段 8（Web 扫码登录接入）。
+- **当前完成阶段**：第八阶段：网页扫码登录接入与体验完善（`08-扫码登录接入`）
+- **当前代码分支**：`feature/stage-08-web-qr-login`
+- **基线提交**：`9cc556b` (stage 7 complete)
+- **交付状态**：已完成雨课堂网页端扫码登录流程全栈集成；通过真实 Playwright Chromium 验证了雨课堂 4 大校区服务器（`www.yuketang.cn`、`changjiang.yuketang.cn`、`pro.yuketang.cn`、`huanghe.yuketang.cn`）在无头环境下的扫码登录能力与 DOM 结构；实现专用的临时隔离无头浏览器会话管理、二维码内存临时提取（`Cache-Control: no-store`，不落地磁盘）、超时倒计时与刷新、人机安全验证障碍感知、扫码成功后的原子会话写入及后台 Worker 自动平滑恢复；通过全量自动化测试（198/198 测试全部绿灯）与真实 Playwright UI 测试。
 
 ---
 
@@ -166,14 +166,61 @@ docker compose build && docker compose up -d
 
 ---
 
-## 9. 第八阶段就绪清单 (Stage 8 Entry Readiness Checklist)
+## 9. 第八阶段完成清单 (Stage 8 Completion Checklist)
 
-- [x] **Web 管理面板上线**：HDU 风格暗黑面板与 FastAPI 后端核心已开发并通过测试。
-- [x] **统一网关安全可控**：Caddy `:40010` 带 Basic Auth 鉴权及证书灵活配置就绪。
-- [x] **平滑向后兼容**：现有 `./data` 目录与数据结构完全兼容，支持随时无损迁移或一键切回单容器。
-- [ ] **阶段 8 规划（待开展）**：
-  - 雨课堂网页端扫码登录流程 Web 化集成；
-  - 在面板“会话管理”页面直接获取雨课堂微信登录二维码，轮询换取登录 Cookie；
-  - 彻底免除本地 CLI 导出并手动上传步骤，实现全流程 Web 端闭环。
+- [x] **真实站点无头扫码能力验证**：通过真实 Playwright Chromium 对雨课堂四大服务器（雨课堂/长江/荷塘/黄河）登录页实际元素抽检，证实 `#qrcode-box img.logma` 均能稳定提供完整扫码二维码。
+- [x] **QRLoginManager 专用会话管理**：
+  - 启动前自动检查并优雅暂停运行中的 Worker，杜绝同账号双开与会话覆盖竞态；
+  - 采用 `threading.RLock` 与单会话锁机制，严格禁止多实例重复启动；
+  - 二维码仅在内存中以 Base64 Data URL 临时持有并推送到前端，绝不写入公开静态目录；
+  - HTTP 接口严格配置 `Cache-Control: no-store, no-cache, must-revalidate`；
+  - 实时感知人机安全验证障碍（如腾讯滑块或 hCaptcha），及时提示并优雅回退至本地 CLI 导入；
+  - 180 秒严格超时与主动取消机制，退出时安全销毁 Playwright 浏览器上下文；
+  - 扫码成功后使用 `validate_session_data` 校验，临时文件 + `os.replace` 原子写入 `browser_state.json`；
+  - 自动平滑恢复 Worker 至登录前期望的运行模式（`observe` / `auto`）。
+- [x] **前端 Web 体验完善**：
+  - 在 HDU 风格管理面板“会话管理”选项卡首屏嵌入“📱 网页扫码登录”模块；
+  - 支持快捷选择雨课堂 4 大校区站点；
+  - 实时倒计时（180s）、二维码过期遮罩与一键刷新、主动取消登录按键；
+  - 成功/失败/需本地验证等状态图标与 Toast 动态提示；
+  - 保留原有拖拽与粘贴 JSON 作为可靠备用回退。
+- [x] **自动化测试与端到端 UI 验证**：
+  - 新增 `tests/test_web_qr_login.py`（9 项单元与 API 集成测试全部通过）；
+  - 更新 `tests/test_web_ui_playwright.py`（真实无头 Chromium UI 渲染与 Tab 切换测试全部通过）；
+  - 全量自动化测试：**198/198 PASS（Ran 198 tests in 9.561s - OK）**，0 失败，0 错误。
+
+---
+
+## 10. 第八阶段新增与修改的组件清单
+
+| 模块/文件 | 变更类型 | 关键设计与职责 |
+|---|---|---|
+| `src/web/login_manager.py` | [NEW] | **雨课堂网页扫码登录生命周期管理器 (QRLoginManager)**：<br>1. 线程安全（`threading.RLock`）的独立登录任务守护；<br>2. 专用 Headless Chromium 实例隔离运行，自动定位 `#qrcode-box img.logma`；<br>3. 二维码纯内存安全提取，绝不落地磁盘；<br>4. 智能识别扫码成功、超时过期、人机滑块验证等多种状态；<br>5. 登录成功后原子更新 `browser_state.json` 并自动恢复 Worker 期望运行模式。 |
+| `src/web/app.py` | [MODIFY] | **新增扫码登录 RESTful 控制端点**：<br>1. `POST /api/login/qr/start`：启动扫码登录任务（响应头注入 `Cache-Control: no-store`）；<br>2. `GET /api/login/qr/status`：获取当前扫码状态与临时二维码数据；<br>3. `POST /api/login/qr/refresh`：重新请求最新二维码；<br>4. `POST /api/login/qr/cancel`：用户主动取消登录流程。 |
+| `src/web/manager.py` | [MODIFY] | 为 `ProcessManager` 增加 `desired_mode` 属性与 `get_desired_mode()` 访问方法，与 `login_manager` 形成优雅契约。 |
+| `src/web/static/index.html` | [MODIFY] | 在“会话管理”选项卡首屏新增“📱 网页扫码登录”卡片，包含服务器选择下拉框、开始/刷新/取消控制按钮、二维码展示容器、过期遮罩与倒计时指示器。 |
+| `src/web/static/app.js` | [MODIFY] | 增补网页扫码登录前端控制逻辑（`initQRLogin`、`startQRLogin`、`startQRPolling`、`renderQRStatus`、`refreshQRLogin`、`cancelQRLogin`），支持 1.5 秒动态轮询、断线容错与状态机驱动渲染。 |
+| `tests/test_web_qr_login.py` | [NEW] | 9 项针对 `QRLoginManager` 与 FastAPI 路由的单元测试与接口集成测试。 |
+| `tests/test_web_ui_playwright.py` | [MODIFY] | 增补对“会话管理”页面扫码登录卡片、4 所高校服务器选项与开始按键的真实 Chromium 渲染核验。 |
+
+---
+
+## 11. 阶段 6 至 8 全流程改造总览与成果汇总
+
+经过第 6、7、8 三个关键阶段的严密实施与工程闭环，Rainclass Assistant 已成功完成由底层核心修复到上层 Web 统一管理的全面跃升：
+
+1. **阶段 6（修复与真实浏览器验收）**：
+   - 彻底闭环所有 P1/P2 安全缺陷（精确域名边界防御、同路由切题旧答案阻断、题目终态与统计解耦、AI 绝对截止期丢弃、extra_body 解耦自适应与 Dockerfile 标签固化）；
+   - 完成真实 Playwright Chromium 100 轮连续基准测评（成功率 100.0%，端到端 P95 250ms）。
+2. **阶段 7（HDU 风格 Web 面板与 Caddy 网关）**：
+   - 实现了基于 FastAPI + HDU 暗黑风格（`#0f1419`）的完整单页应用；
+   - 搭建 Caddy 2 HTTPS 反向代理（`:40010`，Basic Auth `LzK` / `LzK`，SSE 实时日志流推）；
+   - 提供双容器编排配置 `compose.panel.yaml`，完全复用现有 NAS 数据目录与非 root 权限。
+3. **阶段 8（网页扫码登录与体验完善）**：
+   - 实现了无头环境下的雨课堂网页扫码登录全流程闭环；
+   - 免除本地 PC CLI 导出并上传的繁琐操作，在手机端即可直接完成微信/雨课堂 APP 扫码登录；
+   - 具备内存提取、互斥防重、人机验证感知、超时自愈与原子会话更新机制；
+   - 全项目 198 项自动化测试全部 100% 绿灯通过。
+
 
 

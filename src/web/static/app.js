@@ -13,6 +13,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initLogStream();
   initDropzone();
   initForms();
+  initQRLogin();
 
   // 初始加载
   fetchStatus();
@@ -614,3 +615,284 @@ function appendLogEntry(entry, doScroll = true) {
     terminal.scrollTop = terminal.scrollHeight;
   }
 }
+
+// ==================== 网页扫码登录交互 ====================
+
+let qrPollInterval = null;
+
+function initQRLogin() {
+  const btnStart = document.getElementById("btn-start-qr");
+  const btnRefresh = document.getElementById("btn-refresh-qr");
+  const btnMaskRefresh = document.getElementById("btn-mask-refresh");
+  const btnCancel = document.getElementById("btn-cancel-qr");
+
+  if (btnStart) btnStart.addEventListener("click", startQRLogin);
+  if (btnRefresh) btnRefresh.addEventListener("click", refreshQRLogin);
+  if (btnMaskRefresh) btnMaskRefresh.addEventListener("click", refreshQRLogin);
+  if (btnCancel) btnCancel.addEventListener("click", cancelQRLogin);
+
+  // 初始检查是否有活跃登录任务
+  checkInitialQRStatus();
+}
+
+async function checkInitialQRStatus() {
+  try {
+    const res = await fetch("/api/login/qr/status");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.active) {
+      startQRPolling();
+      renderQRStatus(data);
+    }
+  } catch (e) {}
+}
+
+async function startQRLogin() {
+  const server = document.getElementById("qr-server-select").value;
+  const btnStart = document.getElementById("btn-start-qr");
+  btnStart.disabled = true;
+  btnStart.textContent = "⏳ 正在发起登录...";
+
+  try {
+    const res = await fetch("/api/login/qr/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ server }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+    }
+
+    showToast("已启动隔离无头浏览器，正在获取登录二维码...", "info");
+    startQRPolling();
+  } catch (err) {
+    showToast(err.message || "启动扫码登录失败", "error");
+  } finally {
+    btnStart.disabled = false;
+    btnStart.textContent = "🚀 开始扫码登录";
+  }
+}
+
+function startQRPolling() {
+  if (qrPollInterval) clearInterval(qrPollInterval);
+  pollQRStatusOnce();
+  qrPollInterval = setInterval(pollQRStatusOnce, 1500);
+}
+
+function stopQRPolling() {
+  if (qrPollInterval) {
+    clearInterval(qrPollInterval);
+    qrPollInterval = null;
+  }
+}
+
+async function pollQRStatusOnce() {
+  try {
+    const res = await fetch("/api/login/qr/status");
+    if (!res.ok) return;
+    const data = await res.json();
+    renderQRStatus(data);
+  } catch (err) {
+    console.error("轮询扫码状态失败:", err);
+  }
+}
+
+function renderQRStatus(data) {
+  const badge = document.getElementById("qr-global-badge");
+  const boxIdle = document.getElementById("qr-box-idle");
+  const boxLoading = document.getElementById("qr-box-loading");
+  const boxActive = document.getElementById("qr-box-active");
+  const boxResult = document.getElementById("qr-box-result");
+
+  const btnStart = document.getElementById("btn-start-qr");
+  const btnRefresh = document.getElementById("btn-refresh-qr");
+  const btnCancel = document.getElementById("btn-cancel-qr");
+
+  const qrImg = document.getElementById("qr-code-img");
+  const maskExpired = document.getElementById("qr-mask-expired");
+  const statusMsg = document.getElementById("qr-status-msg");
+  const timerMsg = document.getElementById("qr-timer-msg");
+
+  const state = data.state || "idle";
+
+  if (state === "idle") {
+    stopQRPolling();
+    badge.className = "badge badge-gray";
+    badge.textContent = "未开启";
+    boxIdle.style.display = "block";
+    boxLoading.style.display = "none";
+    boxActive.style.display = "none";
+    boxResult.style.display = "none";
+    btnStart.style.display = "block";
+    btnRefresh.style.display = "none";
+    btnCancel.style.display = "none";
+    return;
+  }
+
+  if (state === "starting") {
+    badge.className = "badge badge-blue";
+    badge.textContent = "启动中...";
+    boxIdle.style.display = "none";
+    boxLoading.style.display = "block";
+    boxActive.style.display = "none";
+    boxResult.style.display = "none";
+    btnStart.style.display = "none";
+    btnRefresh.style.display = "none";
+    btnCancel.style.display = "block";
+    return;
+  }
+
+  if (state === "waiting_scan" || state === "scanned") {
+    badge.className = state === "scanned" ? "badge badge-blue" : "badge badge-yellow";
+    badge.textContent = state === "scanned" ? "已扫码确认中" : "等待扫码";
+
+    boxIdle.style.display = "none";
+    boxLoading.style.display = "none";
+    boxActive.style.display = "block";
+    boxResult.style.display = "none";
+
+    btnStart.style.display = "none";
+    btnRefresh.style.display = "block";
+    btnCancel.style.display = "block";
+
+    if (data.qr_image) {
+      qrImg.src = data.qr_image;
+    }
+    maskExpired.style.display = "none";
+
+    statusMsg.textContent = state === "scanned" 
+      ? "📲 检测到扫码，正在确认登录并持久化凭据..." 
+      : (data.message || "请使用微信或雨课堂 APP 扫码");
+
+    timerMsg.textContent = `剩余有效时间: ${data.expires_in || 0}s`;
+    return;
+  }
+
+  if (state === "expired") {
+    badge.className = "badge badge-red";
+    badge.textContent = "二维码已过期";
+
+    boxIdle.style.display = "none";
+    boxLoading.style.display = "none";
+    boxActive.style.display = "block";
+    boxResult.style.display = "none";
+
+    maskExpired.style.display = "flex";
+    statusMsg.textContent = "二维码已过期，请刷新重新获取";
+    timerMsg.textContent = "有效时间: 0s";
+
+    btnStart.style.display = "none";
+    btnRefresh.style.display = "block";
+    btnCancel.style.display = "block";
+    return;
+  }
+
+  if (state === "success") {
+    stopQRPolling();
+    badge.className = "badge badge-green";
+    badge.textContent = "登录成功";
+
+    boxIdle.style.display = "none";
+    boxLoading.style.display = "none";
+    boxActive.style.display = "none";
+    boxResult.style.display = "block";
+
+    document.getElementById("qr-result-icon").textContent = "✅";
+    document.getElementById("qr-result-title").textContent = "登录成功！";
+    document.getElementById("qr-result-desc").textContent = data.message || "凭证已原子保存，系统正在运行中。";
+
+    btnStart.style.display = "block";
+    btnRefresh.style.display = "none";
+    btnCancel.style.display = "none";
+
+    showToast("雨课堂账号登录成功！凭据已保存", "success");
+    fetchStatus();
+    return;
+  }
+
+  if (state === "needs_manual") {
+    stopQRPolling();
+    badge.className = "badge badge-yellow";
+    badge.textContent = "需本地验证";
+
+    boxIdle.style.display = "none";
+    boxLoading.style.display = "none";
+    boxActive.style.display = "none";
+    boxResult.style.display = "block";
+
+    document.getElementById("qr-result-icon").textContent = "⚠️";
+    document.getElementById("qr-result-title").textContent = "需本地命令行登录";
+    document.getElementById("qr-result-desc").textContent = data.error || "雨课堂触发了安全人机验证码，请在本地电脑运行命令行完成首次登录后导入会话。";
+
+    btnStart.style.display = "block";
+    btnRefresh.style.display = "none";
+    btnCancel.style.display = "none";
+
+    showToast("雨课堂触发安全人机验证，请使用本地 CLI 导入", "warning", 6000);
+    return;
+  }
+
+  if (state === "failed") {
+    stopQRPolling();
+    badge.className = "badge badge-red";
+    badge.textContent = "登录失败";
+
+    boxIdle.style.display = "none";
+    boxLoading.style.display = "none";
+    boxActive.style.display = "none";
+    boxResult.style.display = "block";
+
+    document.getElementById("qr-result-icon").textContent = "❌";
+    document.getElementById("qr-result-title").textContent = "登录未成功";
+    document.getElementById("qr-result-desc").textContent = data.error || data.message || "登录流程异常退出。";
+
+    btnStart.style.display = "block";
+    btnRefresh.style.display = "none";
+    btnCancel.style.display = "none";
+
+    showToast(data.error || "登录失败", "error");
+    return;
+  }
+
+  if (state === "cancelled") {
+    stopQRPolling();
+    badge.className = "badge badge-gray";
+    badge.textContent = "已取消";
+
+    boxIdle.style.display = "block";
+    boxLoading.style.display = "none";
+    boxActive.style.display = "none";
+    boxResult.style.display = "none";
+
+    btnStart.style.display = "block";
+    btnRefresh.style.display = "none";
+    btnCancel.style.display = "none";
+    return;
+  }
+}
+
+async function refreshQRLogin() {
+  try {
+    const res = await fetch("/api/login/qr/refresh", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+    showToast("正在重新请求最新二维码...", "info");
+    pollQRStatusOnce();
+  } catch (err) {
+    showToast(err.message || "刷新二维码失败", "error");
+  }
+}
+
+async function cancelQRLogin() {
+  try {
+    const res = await fetch("/api/login/qr/cancel", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+    showToast("已取消扫码登录流程", "info");
+    pollQRStatusOnce();
+  } catch (err) {
+    showToast(err.message || "取消登录失败", "error");
+  }
+}
+

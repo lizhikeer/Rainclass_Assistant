@@ -254,6 +254,77 @@
 
     <!-- 3. 会话管理 -->
     <section id="tab-session" class="tab-pane">
+      <!-- 网页扫码登录 (首选推荐) -->
+      <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+          <div class="card-title">📱 网页扫码登录 (微信 / 雨课堂 APP)</div>
+          <span id="qr-global-badge" class="badge badge-gray">未开启</span>
+        </div>
+        
+        <div class="grid-2" style="align-items: start;">
+          <div>
+            <div class="form-group">
+              <label class="form-label">选择雨课堂服务器</label>
+              <select class="form-control" id="qr-server-select">
+                <option value="雨课堂">雨课堂 (www.yuketang.cn)</option>
+                <option value="长江雨课堂">长江雨课堂 (changjiang.yuketang.cn)</option>
+                <option value="荷塘雨课堂">荷塘雨课堂 (pro.yuketang.cn)</option>
+                <option value="黄河雨课堂">黄河雨课堂 (huanghe.yuketang.cn)</option>
+              </select>
+              <div class="form-help">请选择与您平时上课一致的雨课堂校区站点</div>
+            </div>
+
+            <div style="margin-top: 16px;">
+              <button class="btn btn-primary" id="btn-start-qr" style="width: 100%; margin-bottom: 8px;">🚀 开始扫码登录</button>
+              <div style="display: flex; gap: 8px;">
+                <button class="btn btn-outline" id="btn-refresh-qr" style="flex: 1; display: none;">↻ 刷新二维码</button>
+                <button class="btn btn-danger" id="btn-cancel-qr" style="flex: 1; display: none;">✖ 取消登录</button>
+              </div>
+            </div>
+
+            <div style="margin-top: 16px; font-size: 12px; color: var(--text-muted); line-height: 1.6;">
+              💡 <strong>操作说明</strong>：点击开始后，系统将启动隔离无头浏览器加载雨课堂登录页面并生成二维码。手机微信或雨课堂 APP 扫码确认后，系统会自动保存有效会话并恢复后台服务。<br>
+              🔒 <strong>安全保护</strong>：二维码仅在内存中临时提取，绝不落地公开目录，超时或取消即刻销毁。
+            </div>
+          </div>
+
+          <!-- 二维码显示区域 -->
+          <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.2); border: 1px dashed var(--border-color); border-radius: var(--radius-md); padding: 20px; min-height: 260px; text-align: center;">
+            <div id="qr-box-idle" style="color: var(--text-muted); font-size: 13px;">
+              <div style="font-size: 40px; margin-bottom: 8px;">📲</div>
+              点击左侧“开始扫码登录”<br>此处将实时显示登录二维码
+            </div>
+
+            <div id="qr-box-loading" style="display: none; color: var(--text-secondary); font-size: 13px;">
+              <div class="spinner" style="margin: 0 auto 12px;"></div>
+              正在启动浏览器并获取最新二维码...
+            </div>
+
+            <div id="qr-box-active" style="display: none; width: 100%; max-width: 220px;">
+              <div style="position: relative; background: #fff; padding: 10px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);">
+                <img id="qr-code-img" src="" alt="雨课堂登录二维码" style="width: 200px; height: 200px; display: block; margin: 0 auto; object-fit: contain;">
+                <div id="qr-mask-expired" style="display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 20, 25, 0.88); color: #fff; flex-direction: column; align-items: center; justify-content: center; border-radius: 8px;">
+                  <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px;">二维码已过期</div>
+                  <button class="btn btn-primary btn-sm" id="btn-mask-refresh">点击刷新</button>
+                </div>
+              </div>
+              <div id="qr-status-msg" style="margin-top: 10px; font-size: 13px; font-weight: 500; color: var(--text-primary);">
+                请使用微信或雨课堂 APP 扫码
+              </div>
+              <div id="qr-timer-msg" style="font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); margin-top: 4px;">
+                剩余有效时间: --s
+              </div>
+            </div>
+
+            <div id="qr-box-result" style="display: none; width: 100%;">
+              <div id="qr-result-icon" style="font-size: 36px; margin-bottom: 8px;">✅</div>
+              <div id="qr-result-title" style="font-size: 15px; font-weight: 600; margin-bottom: 4px;">登录成功！</div>
+              <div id="qr-result-desc" style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="grid-2">
         <!-- 会话状态 -->
         <div class="card">

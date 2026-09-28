@@ -140,6 +140,13 @@ class ProcessManager:
         except Exception as e:
             logger.warning("无法持久化 panel_state.json: %s", e)
 
+    @property
+    def desired_mode(self) -> str:
+        return self._desired_mode
+
+    def get_desired_mode(self) -> str:
+        return self._desired_mode
+
     def is_running(self) -> bool:
         with self._lock:
             if self._process is None:

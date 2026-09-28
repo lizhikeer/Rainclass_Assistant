@@ -61,6 +61,14 @@ class WebUIPlaywrightTests(unittest.TestCase):
             self.assertTrue(page.locator("#tab-session").is_visible())
             self.assertTrue(page.locator("#dropzone").is_visible())
 
+            # 验证扫码登录卡片及服务器选择下拉框
+            self.assertTrue(page.locator("#qr-server-select").is_visible())
+            server_options = page.locator("#qr-server-select option")
+            self.assertEqual(server_options.count(), 4)
+            self.assertTrue(page.locator("#btn-start-qr").is_visible())
+            self.assertTrue(page.locator("#qr-box-idle").is_visible())
+            self.assertEqual(page.locator("#qr-global-badge").inner_text(), "未开启")
+
             # 验证切换至答题记录 Tab
             page.locator('button[data-tab="tab-records"]').click()
             self.assertTrue(page.locator("#tab-records").is_visible())
