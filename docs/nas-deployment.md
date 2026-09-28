@@ -66,7 +66,7 @@ cp config.template.json data/config.json
 APP_UID=1000
 APP_GID=1001
 
-# 运行模式：observe (旁听观察), assist (辅助答题), auto (全自动作答)
+# 运行模式：observe (旁听观察), auto (全自动作答)
 WORKER_MODE=observe
 
 # 宿主机持久化数据目录路径

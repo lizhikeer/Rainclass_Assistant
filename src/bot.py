@@ -15,7 +15,7 @@ import time
 import traceback
 from concurrent.futures import Future
 from datetime import datetime
-from typing import Optional
+from typing import Any, NamedTuple, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from src.browser import DEFAULT_SERVER, YUKETANG_SERVERS
@@ -38,6 +38,17 @@ from src.storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class TaskIdentity(NamedTuple):
+    """不可变任务身份元组，用于全程穿透校验，防同路由换题与状态覆写。"""
+    account_id: str
+    lesson_id: str
+    question_id: str
+    generation: int
+    deadline: float
+    exercise_path: str
+    is_placeholder: bool = False
 
 # 重试间隔（秒）
 RETRY_DELAY = 10
@@ -150,6 +161,7 @@ class Bot:
         self._answer_future: Optional[Future[str]] = None
         self._answer_question_id = ""
         self._answer_exercise_path = ""
+        self._current_task: Optional[TaskIdentity] = None
         self._last_unidentified_log = 0.0
         # 自动截断：记录已触发过的题目，避免同一题重复请求；等待首个答案时按间隔提示。
         self._auto_truncated_question_id = ""
@@ -335,6 +347,20 @@ class Bot:
                 self.log("检测到已有课堂标签页，直接进入。")
                 self._run_classroom_loop(classroom_page)
                 return
+
+            # 若配置了明确的课堂 URL，尝试直接导航进入，无需经由首页慢速查找
+            direct_url = (self.config.get("classroom_url") or "").strip()
+            if direct_url and any(seg in direct_url.lower() for seg in ("/studentlog/", "/lesson/", "/pro/lesson", "/exercise/")):
+                self.log(f"检测到配置的目标课堂 URL，尝试直接导航进入：{direct_url[:100]}")
+                try:
+                    self.browser.page.goto(direct_url, wait_until="domcontentloaded", timeout=15_000)
+                    time.sleep(1)
+                    if self._is_classroom_page(self.browser.page):
+                        self.log("直接导航成功进入目标课堂。")
+                        self._run_classroom_loop(self.browser.page)
+                        return
+                except Exception as e:
+                    self.log(f"直接导航目标课堂失败：{e}，回退到主页寻找...")
 
             # 2. 没有 → 导航到主页面找课
             if not self.browser.ensure_running():
@@ -873,6 +899,14 @@ class Bot:
                 if self.auto_answer or self.mode == "observe":
                     # AI 异步请求等待期加速：如果已有 Future 在等待，使用短片轮询检查
                     if self._answer_future is not None:
+                        task = getattr(self, "_current_task", None)
+                        if task and not task.is_placeholder:
+                            current_qid = self._question_id(page, None)
+                            if current_qid and current_qid != task.question_id:
+                                self.log(f"检测到同路由换题 (原题目 {task.question_id} -> 新题目 {current_qid})，立即废弃旧题任务。")
+                                self._abandon_pending_answer("同路由换题废弃旧答案")
+                                self._request_generation += 1
+                                continue
                         if self._answer_future.done():
                             self._complete_pending_answer(page)
                         else:
@@ -1012,9 +1046,17 @@ class Bot:
                 self._finish_pending_as_completed("提交答案按钮已消失")
             return
 
-        # AI 请求期间只核对廉价且稳定的路由和提交按钮状态。题目 DOM 会在
-        # 渐进渲染时变化，不能用重新计算的内容哈希判断是否切题。
+        # AI 请求期间核对题目 ID、路由和提交按钮状态。若教师同路由换题，必须及时丢弃旧题任务。
         if self._answer_future is not None:
+            task = getattr(self, "_current_task", None)
+            if task and not task.is_placeholder:
+                current_qid = self._question_id(page, None)
+                if current_qid and current_qid != task.question_id:
+                    self.log(f"检测到同路由换题 (原题目 {task.question_id} -> 新题目 {current_qid})，立即废弃旧题任务。")
+                    self._abandon_pending_answer("同路由换题废弃旧答案")
+                    self._request_generation += 1
+                    return
+
             if self._answer_future.done():
                 self._complete_pending_answer(page)
                 return
@@ -1150,7 +1192,6 @@ class Bot:
 
         self.log("检测到可作答题目，开始获取 AI 答案。")
         try:
-            tracker.mark("ai_request_started")
             if time.time() - self._last_notify_time > 30:
                 self._notify(
                     "自动答题提醒",
@@ -1170,8 +1211,16 @@ class Bot:
             # 统一准备一份完整题图（支持回退至截图，同轮模型复用）
             screenshot_b64 = self._prepare_question_image_b64(page, image_url=image_url, budget=budget)
             if not screenshot_b64:
-                screenshot_b64 = "mock_image_base64"
+                self.log(f"题目 [{question_id}] 图片获取及截图均失败，放弃向 AI 发送请求。")
+                if self.storage:
+                    self.storage.record_stage(
+                        self.account_id, lesson_id, question_id, self._request_generation,
+                        stage=STAGE_SKIPPED, error_reason="image_failed",
+                    )
+                self._finish_question(question_id, STAGE_SKIPPED, lesson_id=lesson_id, generation=self._request_generation, error_reason="image_failed")
+                return
 
+            tracker.mark("ai_request_started")
             future = self.ai.submit_answer(
                 image_b64=screenshot_b64,
                 deadline=deadline,
@@ -1184,13 +1233,34 @@ class Bot:
                 )
         except Exception as e:
             self.log(f"AI 答题请求启动失败：{e}")
-            self._finish_question(question_id, False)
+            self._finish_question(question_id, STAGE_FAILED, lesson_id=lesson_id, generation=self._request_generation, error_reason=str(e))
             return
 
+        is_placeholder = False
+        try:
+            quiz_data = page.evaluate("() => ({text: (document.body ? document.body.innerText : ''), options: [...document.querySelectorAll('[data-option]')].map(e => e.getAttribute('data-option'))})")
+            if isinstance(quiz_data, dict):
+                opts = quiz_data.get("options") or []
+                txt = str(quiz_data.get("text") or "")
+                if not opts or "加载中" in txt:
+                    is_placeholder = True
+        except Exception:
+            pass
+
+        task = TaskIdentity(
+            account_id=self.account_id,
+            lesson_id=lesson_id,
+            question_id=question_id,
+            generation=self._request_generation,
+            deadline=deadline,
+            exercise_path=self._exercise_path(page),
+            is_placeholder=is_placeholder,
+        )
+        self._current_task = task
         self._answer_future = future
         self._answer_question_id = question_id
-        self._answer_exercise_path = self._exercise_path(page)
-        self._answer_generation = self._request_generation
+        self._answer_exercise_path = task.exercise_path
+        self._answer_generation = task.generation
 
         # 测试桩或缓存结果可能立即完成。
         if future.done():
@@ -1254,8 +1324,7 @@ class Bot:
         future = self._answer_future
         question_id = self._answer_question_id
         answer_gen = getattr(self, "_answer_generation", 0)
-        self._answer_future = None
-        self._answer_question_id = ""
+        task = getattr(self, "_current_task", None)
         if future is None or not question_id:
             return
 
@@ -1268,8 +1337,11 @@ class Bot:
             lesson_id = self._lesson_id_from_url(page.url)
         except Exception:
             pass
+        if not lesson_id and task:
+            lesson_id = task.lesson_id
 
-        succeeded = False
+        final_status = STAGE_FAILED
+        final_reason = ""
         try:
             answer_text = future.result()
             if self._current_tracker:
@@ -1280,43 +1352,67 @@ class Bot:
             self.log(f"AI 返回：{answer_text}")
             if self._is_failed_answer(answer_text):
                 self.log("AI 未返回有效答案，本题不再自动重试。")
+                final_status = STAGE_FAILED
+                final_reason = "AI未返回有效答案"
                 return
             qtype, letters, raw_answer = self._parse_ai_answer(answer_text)
             if qtype is None:
                 self.log("AI 返回格式不符合约定，本题不再自动重试。")
+                final_status = STAGE_FAILED
+                final_reason = "AI返回格式不符合约定"
                 return
             if qtype == "unknown":
                 self.log("AI 模型没有可用的视觉能力，已跳过本题。")
+                final_status = STAGE_SKIPPED
+                final_reason = "AI模型无可用视觉能力"
                 if self.storage:
                     self.storage.record_stage(
                         self.account_id, lesson_id, question_id, answer_gen,
-                        stage=STAGE_SKIPPED, error_reason="AI模型无可用视觉能力",
+                        stage=STAGE_SKIPPED, error_reason=final_reason,
                     )
-                succeeded = True
                 return
             if qtype in ("fill", "sub"):
                 self.log("AI 判定为主观/填空题，不自动作答，本题结束。")
+                final_status = STAGE_SKIPPED
+                final_reason = "主观/填空题跳过"
                 if self.storage:
                     self.storage.record_stage(
                         self.account_id, lesson_id, question_id, answer_gen,
-                        stage=STAGE_SKIPPED, error_reason="主观/填空题跳过",
+                        stage=STAGE_SKIPPED, error_reason=final_reason,
                     )
-                succeeded = True
                 return
 
             # 代际与页面状态核验
             if self._request_generation != answer_gen:
                 self.log("AI 返回时题目代际已发生变更，已丢弃旧答案。")
+                final_status = STAGE_SKIPPED
+                final_reason = "题目代际变更丢弃"
                 return
             if not self._is_exercise_page(page):
                 self.log("AI 返回前答题页面已关闭，已丢弃旧答案。")
+                final_status = STAGE_SKIPPED
+                final_reason = "答题页面已关闭"
                 return
             if self._exercise_path(page) != self._answer_exercise_path:
                 self.log("AI 返回前题目路由已经变化，已丢弃旧答案。")
+                final_status = STAGE_SKIPPED
+                final_reason = "题目路由变化丢弃"
                 return
+
+            # 同路由换题检测：核验当前页面题目标识是否已变化
+            task = getattr(self, "_current_task", None)
+            if task and not task.is_placeholder:
+                current_qid = self._question_id(page, None)
+                if current_qid and current_qid != task.question_id:
+                    self.log(f"AI 返回时当前页面题目已切换 ({task.question_id} -> {current_qid})，丢弃旧题答案，不点击选项。")
+                    final_status = STAGE_SKIPPED
+                    final_reason = "同路由换题旧答案丢弃"
+                    return
+
             if not self._has_submit_button(page):
                 self.log("AI 返回时提交答案按钮已消失，本题不再重复作答。")
-                succeeded = True
+                final_status = STAGE_SKIPPED
+                final_reason = "提交按钮消失"
                 return
 
             if letters:
@@ -1327,13 +1423,19 @@ class Bot:
                 if not clicked:
                     self.log("AI 未能提供有效选项，本题不再自动重试。")
                     self._notify_answer_failure(answer_text)
+                    final_status = STAGE_FAILED
+                    final_reason = "未能匹配有效选项"
                     return
             if not clicked:
+                final_status = STAGE_FAILED
+                final_reason = "选项点击失败"
                 return
             # 点击选项后确认选择已生效（按钮进入 can 态），否则提交会命中
             # 灰色按钮而不生效，还会误判为已作答。
             if not self._wait_submit_ready(page):
                 self.log("选项点击未生效（提交按钮未进入可提交状态），本题不再自动重试。")
+                final_status = STAGE_FAILED
+                final_reason = "提交按钮未就绪"
                 return
             if self._current_tracker:
                 self._current_tracker.mark("answer_validated")
@@ -1345,16 +1447,29 @@ class Bot:
                     submitted_answer=str(letters or raw_answer),
                 )
 
-            # 提交前再次确认代际与提交按钮
+            # 提交前再次确认代际、题目标识与提交按钮
             if self._request_generation != answer_gen:
                 self.log("提交前题目代际已变更，已中止提交。")
+                final_status = STAGE_SKIPPED
+                final_reason = "提交前代际变更"
                 return
+            if task and not task.is_placeholder:
+                current_qid = self._question_id(page, None)
+                if current_qid and current_qid != task.question_id:
+                    self.log(f"提交前题目已变更 ({task.question_id} -> {current_qid})，已中止提交。")
+                    final_status = STAGE_SKIPPED
+                    final_reason = "提交前换题中止"
+                    return
             if not self._has_submit_button(page):
                 self.log("提交前提交按钮已消失，已中止提交。")
+                final_status = STAGE_SKIPPED
+                final_reason = "提交前按钮消失"
                 return
 
             submit_delay = self._int_setting("submit_delay", 0, 0, 300)
             if submit_delay > 0 and self.stop_event.wait(submit_delay):
+                final_status = STAGE_UNKNOWN
+                final_reason = "提交延迟期间收到停止信号"
                 return
 
             if self.storage:
@@ -1365,36 +1480,51 @@ class Bot:
 
             if self._current_tracker:
                 self._current_tracker.mark("submit_clicked")
-            succeeded = self._submit_answer(page)
+            confirmed = self._submit_answer(page, question_id=question_id, lesson_id=lesson_id, generation=answer_gen)
+            if confirmed:
+                final_status = STAGE_CONFIRMED
+            else:
+                final_status = STAGE_UNKNOWN
+                final_reason = "提交未决待核对"
         except Exception as e:
             self.log(f"AI 答题结果处理失败：{e}")
+            final_status = STAGE_FAILED
+            final_reason = str(e)
         finally:
-            self._finish_question(question_id, succeeded)
+            self._answer_future = None
+            self._answer_question_id = ""
+            self._answer_exercise_path = ""
+            self._current_task = None
+            self._finish_question(question_id, final_status, lesson_id=lesson_id, generation=answer_gen, error_reason=final_reason)
 
     def _finish_pending_as_completed(self, reason: str) -> None:
         """提交按钮消失时结束尚未完成的 AI 请求。"""
         future = self._answer_future
         question_id = self._answer_question_id
+        gen = self._answer_generation or self._request_generation
         self._answer_future = None
         self._answer_question_id = ""
         self._answer_exercise_path = ""
         self._answer_generation = 0
+        self._current_task = None
         if future is not None:
             future.cancel()
         if self._current_tracker is not None:
-            self._current_tracker.finish(True, error_reason=reason)
+            self._current_tracker.finish(False, error_reason=reason)
             self._current_tracker = None
         if question_id:
             self.log(f"{reason}，本题已结束处理。")
-            self._finish_question(question_id, True)
+            self._finish_question(question_id, STAGE_SKIPPED, generation=gen, error_reason=reason)
 
     def _abandon_pending_answer(self, reason: str) -> None:
         future = self._answer_future
         question_id = self._answer_question_id
+        gen = self._answer_generation or self._request_generation
         self._answer_future = None
         self._answer_question_id = ""
         self._answer_exercise_path = ""
         self._answer_generation = 0
+        self._current_task = None
         if future is not None:
             future.cancel()
         if self._current_tracker is not None:
@@ -1402,7 +1532,7 @@ class Bot:
             self._current_tracker = None
         if question_id:
             self.log(f"{reason}，已丢弃旧题 AI 请求。")
-            self._finish_question(question_id, False)
+            self._finish_question(question_id, STAGE_SKIPPED, generation=gen, error_reason=reason)
 
     def _begin_question(self, question_id: str) -> bool:
         """进入题目处理状态；同一道题只允许发起一次 AI 请求。"""
@@ -1414,34 +1544,63 @@ class Bot:
         self._set_question_state(question_id, "inflight", attempts + 1)
         return True
 
-    def _finish_question(self, question_id: str, succeeded: bool) -> None:
+    def _finish_question(
+        self,
+        question_id: str,
+        status: Any,
+        lesson_id: str = "",
+        generation: int = 0,
+        error_reason: str = "",
+    ) -> None:
+        if isinstance(status, bool):
+            status = STAGE_CONFIRMED if status else STAGE_FAILED
+
+        is_completed = (status == STAGE_CONFIRMED) or (
+            status == STAGE_SKIPPED and error_reason in ("AI模型无可用视觉能力", "主观/填空题跳过", "提交答案按钮已消失")
+        )
+        state = "completed" if is_completed else "failed"
         attempts = self._question_states.get(question_id, ("", 0.0, 1))[2]
-        state = "completed" if succeeded else "failed"
         self._set_question_state(question_id, state, attempts)
         if self._current_tracker is not None:
-            self._current_tracker.finish(succeeded)
+            self._current_tracker.finish(status == STAGE_CONFIRMED, error_reason=error_reason)
             self._current_tracker = None
 
         if self.storage:
-            lesson_id = ""
-            try:
-                lesson_id = self._lesson_id_from_url(self.browser.page.url)
-            except Exception:
-                pass
-            gen = self._answer_generation or self._request_generation
-            if succeeded:
+            if not lesson_id:
+                try:
+                    lesson_id = self._lesson_id_from_url(self.browser.page.url)
+                except Exception:
+                    pass
+            gen = generation or self._answer_generation or self._request_generation
+
+            if status == STAGE_CONFIRMED:
                 self.storage.record_stage(
                     self.account_id, lesson_id, question_id, gen,
                     stage=STAGE_CONFIRMED, submission_confirmed=1,
                 )
+            elif status == STAGE_SKIPPED:
+                self.storage.record_stage(
+                    self.account_id, lesson_id, question_id, gen,
+                    stage=STAGE_SKIPPED, error_reason=error_reason or "跳过作答",
+                )
+            elif status == STAGE_UNKNOWN:
+                # 保持待核对状态，绝不覆写为 FAILED 或 CONFIRMED
+                self.storage.record_stage(
+                    self.account_id, lesson_id, question_id, gen,
+                    stage=STAGE_UNKNOWN, error_reason=error_reason or "提交未决待核对",
+                )
             else:
                 self.storage.record_stage(
                     self.account_id, lesson_id, question_id, gen,
-                    stage=STAGE_FAILED,
+                    stage=STAGE_FAILED, error_reason=error_reason or "作答失败",
                 )
 
-        if succeeded:
+        if status == STAGE_CONFIRMED:
             self.log("当前题目已确认处理完成。")
+        elif status == STAGE_SKIPPED:
+            self.log(f"当前题目已跳过处理 ({error_reason or '主动跳过'})。")
+        elif status == STAGE_UNKNOWN:
+            self.log("当前题目提交未决，保持待核对状态。")
         else:
             self.log("当前题目处理失败，本轮不再自动重试。")
         self._update_state(BotState.MONITORING, "题目处理结束，继续监控课堂")
@@ -1874,13 +2033,28 @@ class Bot:
             return False
         return None
 
-    def _submit_answer(self, page: Page) -> bool:
+    def _submit_answer(
+        self,
+        page: Page,
+        question_id: str = "",
+        lesson_id: str = "",
+        generation: int = 0,
+    ) -> bool:
         """提交答案。仅以提交按钮状态判断结果（准则：按钮存在 = 未作答）。
 
         True  = 已确认提交：点击后按钮消失，或已离开 exercise 页面。
         False = 仍未作答：未找到按钮、点击失败，或点击后按钮仍然存在。
         返回 False 的题在本轮运行中不会再次调用 AI。
         """
+        target_qid = question_id or self._answer_question_id
+        target_gen = generation or self._answer_generation or self._request_generation
+        target_lesson = lesson_id
+        if not target_lesson:
+            try:
+                target_lesson = self._lesson_id_from_url(page.url)
+            except Exception:
+                pass
+
         try:
             submit_btn = self._find_submit_button(page)
             if submit_btn is None:
@@ -1906,28 +2080,16 @@ class Bot:
 
         if self.stop_event.is_set():
             self.log("退出信号触发，提交确认未完成，记录为待核对状态而非成功。")
-            if self.storage and self._answer_question_id:
-                lesson_id = ""
-                try:
-                    lesson_id = self._lesson_id_from_url(page.url)
-                except Exception:
-                    pass
+            if self.storage and target_qid:
                 self.storage.record_stage(
-                    self.account_id, lesson_id, self._answer_question_id,
-                    self._answer_generation or self._request_generation,
+                    self.account_id, target_lesson, target_qid, target_gen,
                     stage=STAGE_UNKNOWN, error_reason="关机中断待核对",
                 )
             return False
 
-        if self.storage and self._answer_question_id:
-            lesson_id = ""
-            try:
-                lesson_id = self._lesson_id_from_url(page.url)
-            except Exception:
-                pass
+        if self.storage and target_qid:
             self.storage.record_stage(
-                self.account_id, lesson_id, self._answer_question_id,
-                self._answer_generation or self._request_generation,
+                self.account_id, target_lesson, target_qid, target_gen,
                 stage=STAGE_UNKNOWN, error_reason="已点击提交但超时后按钮仍存在",
             )
         self.log("已点击提交，但提交按钮仍存在，视为未作答，本题不再自动重试。")

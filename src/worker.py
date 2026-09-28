@@ -237,9 +237,14 @@ def run_worker(args: Optional[argparse.Namespace] = None) -> int:
     try:
         config = Config.load_strict(paths.config_file)
     except ConfigError as err:
-        # 自检或普通启动均报错
-        print(f"配置错误：\n{err}", file=sys.stderr)
-        return EXIT_ERROR
+        if getattr(args, "login", False) or getattr(args, "import_session_path", None):
+            # 登录或导入在全新空数据目录中允许使用默认配置
+            logger.warning("配置文件未就绪或未通过严格校验，登录/导入将使用默认配置。")
+            config = Config(file_path=paths.config_file)
+        else:
+            # 自检或普通启动均报错
+            print(f"配置错误：\n{err}", file=sys.stderr)
+            return EXIT_ERROR
 
     server_name = config.get("yuketang_server")
     classroom_url = config.get("classroom_url", "")
@@ -400,8 +405,29 @@ def run_worker(args: Optional[argparse.Namespace] = None) -> int:
                 exit_code = EXIT_NEEDS_LOGIN
                 if not getattr(args, "wait_for_session", False):
                     break
-                logger.info("会话失效，等待重新导入...")
-                if stop_event.wait(10):
+                
+                # 记录当前失效文件的修改时间，防止在同一份失效文件上每 10 秒空转拉起一次浏览器
+                last_mtime = None
+                try:
+                    if os.path.exists(paths.state_file):
+                        last_mtime = os.path.getmtime(paths.state_file)
+                except Exception:
+                    pass
+
+                logger.info("会话已失效，等待新会话文件导入 (文件更新前保持心跳，不再空转拉起浏览器)...")
+                while not stop_event.is_set():
+                    status_tracker.heartbeat()
+                    if stop_event.wait(5):
+                        break
+                    try:
+                        if os.path.exists(paths.state_file):
+                            cur_mtime = os.path.getmtime(paths.state_file)
+                            if last_mtime is None or cur_mtime > last_mtime:
+                                logger.info("检测到会话文件已被更新，准备重新启动会话校验...")
+                                break
+                    except Exception:
+                        pass
+                if stop_event.is_set():
                     break
             elif bot.state == BotState.ERROR:
                 status_tracker.set_state(ServiceState.ERROR, "Bot 发生严重错误退出")

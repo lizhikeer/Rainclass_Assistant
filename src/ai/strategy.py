@@ -235,6 +235,13 @@ class StrategyRunner:
             decision.winning_answer = "答题请求已取消或过期"
             return decision
 
+        if time.monotonic() >= deadline:
+            decision.timeout_count += 1
+            decision.winning_answer = "已超过截止时间，跳过主模型调用"
+            decision.is_success = False
+            decision.total_duration_ms = (time.monotonic() - start_ts) * 1000.0
+            return decision
+
         primary_timeout = max(0.05, min(primary_endpoint.timeout, deadline - time.monotonic()))
         decision.requests_sent += 1
         logger.info("fast_single: 启动主模型 [%s] (超时 %.1fs)", primary_endpoint.name, primary_timeout)
@@ -247,6 +254,18 @@ class StrategyRunner:
 
         if primary_res.usage:
             decision.token_usage[primary_endpoint.name] = primary_res.usage
+
+        # 绝对截止时间强校验：若模型返回时已超过截止时间，答案必须被彻底废弃
+        if time.monotonic() > deadline:
+            decision.timeout_count += 1
+            decision.winning_answer = f"主模型响应已超截止时间 (超限 {(time.monotonic() - deadline):.2f}s)"
+            decision.is_success = False
+            decision.total_duration_ms = (time.monotonic() - start_ts) * 1000.0
+            logger.warning(
+                "fast_single: 主模型 [%s] 响应超时已超过截止时间，答案被丢弃",
+                primary_endpoint.name,
+            )
+            return decision
 
         if primary_res.is_submittable:
             decision.winning_model = primary_endpoint.name
@@ -308,6 +327,18 @@ class StrategyRunner:
         decision.model_latencies[backup_endpoint.name] = backup_res.latency_ms
         if backup_res.usage:
             decision.token_usage[backup_endpoint.name] = backup_res.usage
+
+        # 绝对截止时间强校验：若备用模型返回时已超过截止时间，答案必须被彻底废弃
+        if time.monotonic() > deadline:
+            decision.timeout_count += 1
+            decision.winning_answer = f"备用模型响应已超截止时间 (超限 {(time.monotonic() - deadline):.2f}s)"
+            decision.is_success = False
+            decision.total_duration_ms = (time.monotonic() - start_ts) * 1000.0
+            logger.warning(
+                "fast_single: 备用模型 [%s] 响应超时已超过截止时间，答案被丢弃",
+                backup_endpoint.name,
+            )
+            return decision
 
         if backup_res.is_submittable:
             decision.winning_model = backup_endpoint.name
@@ -448,6 +479,10 @@ class StrategyRunner:
                 decision.token_usage[item.model_name] = item.usage
 
             if item.is_submittable and not winner_res:
+                if time.monotonic() > deadline:
+                    decision.timeout_count += 1
+                    logger.warning("race: 模型 [%s] 答案已超过截止时间，答案被丢弃。", item.model_name)
+                    break
                 # 赢家产生！首个完整且合法的答案立即锁定
                 winner_res = item
                 cancel_round.set()
@@ -471,14 +506,14 @@ class StrategyRunner:
             decision.requests_sent = state["requests_sent"]
             decision.backup_triggered = state["backup_triggered"]
 
-        if winner_res:
+        if winner_res and time.monotonic() <= deadline:
             decision.winning_model = winner_res.model_name
             decision.vote = winner_res.vote
             decision.winning_answer = vote_to_answer(winner_res.vote)  # type: ignore
             decision.is_success = True
             decision.valid_results_count = sum(1 for r in completed_results if r.is_submittable)
         else:
-            decision.winning_answer = "竞速模型均未能在截止时间内获得有效答案"
+            decision.winning_answer = decision.winning_answer or "竞速模型均未能在截止时间内获得有效答案"
             decision.is_success = False
 
         # 统计迟到结果
@@ -604,10 +639,10 @@ class StrategyRunner:
         decision.late_results_count = total_models - received_count
 
         # 结果裁决
-        if early_winner_vote:
+        if early_winner_vote and time.monotonic() <= deadline:
             winning_vote = early_winner_vote
             decision.is_success = True
-        elif not valid_votes:
+        elif not valid_votes or time.monotonic() > deadline:
             decision.is_success = False
             decision.winning_answer = "多模型未能在截止时间内提供有效答案"
             decision.total_duration_ms = (time.monotonic() - start_ts) * 1000.0

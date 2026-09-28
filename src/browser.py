@@ -22,23 +22,52 @@ DEFAULT_STATE_FILE = "browser_state.json"
 
 
 def validate_session_data(data: Any, expected_base_url: Optional[str] = None) -> tuple[bool, str]:
-    """验证会话 JSON 数据结构与雨课堂站点绑定。"""
+    """验证会话 JSON 数据结构、Cookie 有效期与雨课堂站点绑定。"""
     if not isinstance(data, dict):
         return False, "会话数据格式非法（非 JSON 对象）"
     cookies = data.get("cookies", [])
     origins = data.get("origins", [])
+    if not isinstance(cookies, list) or not isinstance(origins, list):
+        return False, "会话数据格式非法（cookies/origins 必须为列表）"
     if not cookies and not origins:
         return False, "会话数据中缺少有效 cookies 或 origins"
 
+    # 1. 结构 Schema 校验
+    for c in cookies:
+        if not isinstance(c, dict):
+            return False, "Cookie 结构非法（必须为字典对象）"
+        if not c.get("name"):
+            return False, "Cookie 缺少名称 (name)"
+
+    # 2. 检查关键 Cookie 过期时间
+    now = time.time()
+    for c in cookies:
+        name = str(c.get("name") or "")
+        expires = c.get("expires") if "expires" in c else c.get("expiry")
+        if isinstance(expires, (int, float)) and expires > 0 and expires < now:
+            if name in ("sessionid", "session_id", "login_token"):
+                return False, f"会话关键 Cookie ({name}) 已过期"
+
+    # 3. 严格域名标签边界与站点匹配校验
     if expected_base_url and cookies:
-        expected_host = urlsplit(expected_base_url).hostname or ""
-        expected_root_domain = ".".join(expected_host.split(".")[-2:]) if "." in expected_host else expected_host
+        expected_host = (urlsplit(expected_base_url).hostname or "").lower()
+        expected_parts = expected_host.split(".")
+        expected_root = ".".join(expected_parts[-2:]) if len(expected_parts) >= 2 else expected_host
+
         has_matching_domain = False
         for c in cookies:
             c_domain = (c.get("domain") or "").lstrip(".").lower()
-            if c_domain and (expected_host.endswith(c_domain) or c_domain.endswith(expected_root_domain) or "yuketang" in c_domain):
-                has_matching_domain = True
-                break
+            if not c_domain:
+                continue
+            c_parts = c_domain.split(".")
+            c_root = ".".join(c_parts[-2:]) if len(c_parts) >= 2 else c_domain
+
+            # 根域严格一致且属于期望根域，并满足全等或点边界子域名匹配（杜绝 not-yuketang.example 等子串攻击）
+            if c_root == expected_root:
+                if expected_host == c_domain or expected_host.endswith("." + c_domain) or c_domain == expected_root:
+                    has_matching_domain = True
+                    break
+
         if not has_matching_domain:
             return False, f"会话 Cookie 域名与当前配置的雨课堂服务器 ({expected_host}) 不匹配"
 

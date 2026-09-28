@@ -133,6 +133,10 @@ class Config:
         with self._lock:
             return self._data.get(key, default)
 
+    def __contains__(self, key: str) -> bool:
+        with self._lock:
+            return key in self._data
+
     def set(self, key: str, value: Any) -> None:
         with self._lock:
             self._data[key] = value

@@ -291,6 +291,29 @@ class AIService:
             self._multi_status["valid"] = valid
             self._multi_status["truncated"] = truncated
 
+    def _resolve_extra_body(self, model_name: str = "", base_url: str = "") -> Optional[dict]:
+        """按配置解析 extra_body；支持用户显式配置 custom_ai_extra_body 或默认禁用思考。"""
+        getter = getattr(self.config, "get", None)
+        if getter is not None:
+            configured = getter("custom_ai_extra_body", None)
+            if configured is not None:
+                if isinstance(configured, dict):
+                    return configured or None
+                if isinstance(configured, str):
+                    trimmed = configured.strip()
+                    if not trimmed:
+                        return None
+                    try:
+                        parsed = json.loads(trimmed)
+                        return parsed if isinstance(parsed, dict) else None
+                    except Exception:
+                        logger.warning("custom_ai_extra_body JSON 解析失败: %s", configured)
+                        return None
+                return None
+
+        # 默认禁用思考参数（优化推理速度与避免模型思考超时）
+        return {"enable_thinking": False, "thinking": {"type": "disabled"}}
+
     def _resolve_endpoint(self, model_name: str) -> EndpointConfig:
         """根据模型名称解析为对应的 EndpointConfig。"""
         name = (model_name or "").strip()
@@ -313,13 +336,15 @@ class AIService:
                 provider_type="gemini",
             )
         elif name == "自定义":
+            model = self.config.get("custom_ai_model", "").strip()
+            base_url = self.config.get("custom_ai_base_url", "").strip()
             return EndpointConfig(
                 name="自定义",
-                base_url=self.config.get("custom_ai_base_url", "").strip(),
+                base_url=base_url,
                 api_key=self.config.get("custom_ai_api_key", "").strip(),
-                model=self.config.get("custom_ai_model", "").strip(),
+                model=model,
                 timeout=15.0,
-                extra_body=NO_THINKING_EXTRA_BODY,
+                extra_body=self._resolve_extra_body(model, base_url),
             )
         else:
             for ep in self._load_multi_ai_endpoints():
@@ -331,15 +356,17 @@ class AIService:
                         model=ep.model,
                         timeout=self._multi_ai_timeout(),
                         description=ep.description,
-                        extra_body=NO_THINKING_EXTRA_BODY,
+                        extra_body=self._resolve_extra_body(ep.model, ep.base_url),
                     )
+            model = name or self.config.get("custom_ai_model", "").strip()
+            base_url = self.config.get("custom_ai_base_url", "").strip()
             return EndpointConfig(
                 name=name or "自定义",
-                base_url=self.config.get("custom_ai_base_url", "").strip(),
+                base_url=base_url,
                 api_key=self.config.get("custom_ai_api_key", "").strip(),
-                model=name or self.config.get("custom_ai_model", "").strip(),
+                model=model,
                 timeout=15.0,
-                extra_body=NO_THINKING_EXTRA_BODY,
+                extra_body=self._resolve_extra_body(model, base_url),
             )
 
     def _load_strategy_endpoints(self) -> list[EndpointConfig]:
@@ -354,6 +381,7 @@ class AIService:
                     model=ep.model,
                     timeout=self._multi_ai_timeout(),
                     description=ep.description,
+                    extra_body=self._resolve_extra_body(ep.model, ep.base_url),
                 )
                 for ep in multi_eps
             ]
@@ -737,7 +765,7 @@ class AIService:
                 ]),
                 timeout=timeout,
                 max_tokens=self.ANSWER_MAX_TOKENS,
-                extra_body=NO_THINKING_EXTRA_BODY,
+                extra_body=self._resolve_extra_body(endpoint.model, endpoint.base_url),
             )
             return (response.choices[0].message.content or "").strip()
         finally:
@@ -1092,7 +1120,7 @@ class AIService:
                 ]),
                 timeout=15,
                 max_tokens=self.ANSWER_MAX_TOKENS,
-                extra_body=NO_THINKING_EXTRA_BODY,
+                extra_body=self._resolve_extra_body(model_id, base_url),
             )
             content = response.choices[0].message.content
             return (content or "").strip()

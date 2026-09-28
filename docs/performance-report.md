@@ -4,19 +4,22 @@
 
 ---
 
-## 1. 核心链路延迟基准测量 (Pipeline Latency Benchmark)
+## 1. 真实浏览器核心链路延迟基准测量 (Real Browser Benchmark)
 
-基于 `tests.benchmark_baseline` 在模拟环境与 NAS 宿主环境下的 100 轮高精度链路测量数据：
+基于 `tests.benchmark_real_browser` 在真实无头 **Playwright Chromium** 环境下，针对本地 `exercise_single.html` 习题桩进行的 100 轮连续受控测量数据（模拟 AI 延时 50ms，成功率 100.0%）：
 
-| 测量阶段 | 目标 SLA | P50 时延 | P90 时延 | P95 时延 | P99 时延 | 达标判定 |
-|---|---|---|---|---|---|---|
-| **阶段 1：题目 DOM 检测 -> 题目就绪** | $\le 300\text{ ms}$ | 0.00 ms | 0.00 ms | 0.00 ms | 0.01 ms |  **PASS** |
-| **阶段 2：题目就绪 -> AI 请求发出** | $\le 500\text{ ms}$ | 0.00 ms | 0.00 ms | 0.00 ms | 0.01 ms |  **PASS** |
-| **阶段 3：AI 结果就绪 -> 选项点击/提交** | $\le 500\text{ ms}$ | 0.00 ms | 0.00 ms | 0.00 ms | 0.02 ms |  **PASS** |
-| **附加层：SQLite WAL 写入与日志全量脱敏** | $\le 10\text{ ms}$ | 0.08 ms | 0.12 ms | 0.16 ms | 0.21 ms |  **PASS** |
+| 测量阶段 | 对应分段指标 | 目标 SLA | 平均耗时 | P50 时延 | P90 时延 | P95 时延 | P99 时延 | Max 时延 | 达标判定 |
+|---|---|---|---|---|---|---|---|---|---|
+| **题目检测与就绪** | `detect_to_ready_ms` | $\le 300\text{ ms}$ | 0.0 ms | 0.0 ms | 0.0 ms | 0.0 ms | 0.0 ms | 0.0 ms |  **PASS** |
+| **截图与题图准备** | `ready_to_ai_start_ms` | $\le 500\text{ ms}$ | 95.5 ms | 94.0 ms | 109.0 ms | 109.0 ms | 110.0 ms | 110.0 ms |  **PASS** |
+| **AI 模型推理响应** | `ai_duration_ms` | 受控桩 50ms | 57.4 ms | 62.0 ms | 63.0 ms | 63.0 ms | 78.0 ms | 78.0 ms |  **PASS** |
+| **真实 DOM 选项点击** | `ai_to_validated_ms` | $\le 500\text{ ms}$ | 47.6 ms | 47.0 ms | 62.0 ms | 62.0 ms | 63.0 ms | 63.0 ms |  **PASS** |
+| **提交点击与确认** | `clicked_to_confirmed_ms` | $\le 500\text{ ms}$ | 38.6 ms | 32.0 ms | 47.0 ms | 47.0 ms | 47.0 ms | 47.0 ms |  **PASS** |
+| **全流程端到端** | `total_end_to_end_ms` | 极速作答 | 248.4 ms | 250.0 ms | 250.0 ms | 250.0 ms | 266.0 ms | 266.0 ms |  **PASS** |
 
 > [!NOTE]
-> 本地逻辑处理、状态机分发、DOM 解析提取以及 SQLite 两阶段记录保存的本地开销在 P99 场景下累计低于 **1 毫秒**，整个流水线的响应瓶颈仅取决于网络 I/O 与大模型生成延迟。
+> 1. **真实 DOM 操作时延**：在真实 Chromium 引擎中，元素截图准备耗时稳定在 94~110ms，DOM 选项查找与点击耗时仅 47~63ms，提交点击与按钮消失确认耗时 32~47ms。
+> 2. **端到端总时延**：在 50ms AI 响应桩下，整题作答全流程 P95 仅需 **250 毫秒**（P99 266 毫秒），为真实大模型留出了充裕的秒级作答窗口。
 
 ---
 

@@ -1,5 +1,5 @@
 # 飞牛 NAS / Docker 部署 Dockerfile
-ARG BASE_IMAGE=python:3.11-slim
+ARG BASE_IMAGE=python:3.11-slim-bookworm
 FROM ${BASE_IMAGE}
 
 # 统一时区为 Asia/Shanghai，纯后台无头模式，固定 Chromium 路径，禁止 Python 缓冲
@@ -26,11 +26,12 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.li
 COPY requirements-worker.txt /app/requirements-worker.txt
 RUN pip install --no-cache-dir -r requirements-worker.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 安装运行 Chromium 所需的 apt 系统共享库依赖
-RUN python -m playwright install-deps chromium || true
+# 安装运行 Chromium 所需的 apt 系统共享库依赖（严格安装，失败直接终止构建）
+RUN python -m playwright install-deps chromium
 
-# 固化已准备的 Chromium 与 FFmpeg 二进制包（构建阶段完全就绪，容器启动无需下载）
-COPY ms-playwright/ /ms-playwright/
+# 固化已准备的 Chromium 与 FFmpeg 二进制包（若本地存在 ms-playwright 优先复用，否则构建阶段自动下载）
+COPY ms-playwright* /ms-playwright/
+RUN if [ ! -d /ms-playwright/chromium* ]; then python -m playwright install chromium; fi
 
 # 复制应用核心源码
 COPY src/ /app/src/

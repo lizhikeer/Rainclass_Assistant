@@ -2,10 +2,10 @@
 
 ## 1. 阶段概述
 
-- **当前完成阶段**：第五阶段：飞牛 NAS 应用部署与端到端验收（`05-飞牛NAS部署与验收.md`）
-- **当前代码分支**：`feature/stage-05-nas-deploy-and-acceptance`
-- **基线提交**：`7d287130b4ec7483a9a13b0c95a02251a31d9ee0` (stage 3 complete) / `stage 4 complete`
-- **交付状态**：已完成标准容器化封装（`Dockerfile`、`compose.yaml`、`.dockerignore`、`.env.example`、`config.template.json`），实现纯无头运行、非 root 权限映射（`1000:1001`）、中文字体支持、内置健康探针；成功部署于实体飞牛 NAS (fnOS / Debian 12 x86_64)；完成 Tier A~D 四层严格验收，旁听模式（`observe`）安全巡检验证（零点击零提交零消耗付费AI），真实 TokenDance DeepSeek v4.1 Flash 思考链禁用优化与 1.58 秒极速响应验证，多阶状态机心跳监控与优雅停机平稳自愈。
+- **当前完成阶段**：第六阶段：修复与真实浏览器验收（`06-修复与真实浏览器验收`）
+- **当前代码分支**：`feature/stage-06-fixes-and-real-browser-acceptance`
+- **基线提交**：`37e007f` (stage 5 complete)
+- **交付状态**：已完成审查发现的所有 P1/P2 缺陷修复（会话边界严格校验、超时强制丢弃、同路由换题旧答案阻断、题目状态解耦、extra_body 解耦自适应与 Dockerfile 标签固化）；通过新增的专用回归测试集（6/6 全部通过）、全量自动化测试（174/174 全部通过，零失败零错误）以及脱机独立诊断探针（全部核验通过）；完成真实 Playwright Chromium 100 轮连续受控基准测评（成功率 100.0%，端到端 P95 250ms）；已就绪进入阶段 7（hdu-grabber 风格 Web 管理面板构建）。
 
 ---
 
@@ -84,3 +84,52 @@ docker compose stop
 # 重建并热更新代码
 docker compose build && docker compose up -d
 ```
+
+---
+
+## 5. 第六阶段核心修复与真实浏览器验收成果
+
+### 5.1 缺陷修复清单 (P1 / P2 审查问题闭环)
+
+| 缺陷编号 | 影响模块 | 问题现象与安全隐患 | 修复方案与设计决策 |
+|---|---|---|---|
+| **P1-1** | `src/browser.py` | 域名校验仅做子串包含判断，攻击者可通过恶意域名（如 `not-yuketang.example`）绕过会话校验。 | 重构 `validate_session_data`，增加标签边界匹配，仅允许 `yuketang.cn` 根域及其合法二级/多级子域名；严格校验必须包含有效 Cookie 列表、有效期与结构完整性。 |
+| **P1-2** | `src/bot.py` | 教师在同路由同 URL 下切换新题目时，旧题尚未完成的在途 AI 结果返回后误点击了新题目的选项并触发错误提交。 | 1. 引入 `TaskIdentity`，绑定账号、课号、题号、代际号、截止期与路由路径；<br>2. 轮询及答案就绪返回时双重核对题目标识；发现新题立即废弃旧任务并中止选项点击与提交；<br>3. 区分占位符动态渲染与真正切题，保障 DOM 渐进式加载稳健。 |
+| **P1-3** | `src/bot.py` | 主观题/填空题跳过或无视觉能力跳过时，状态被误标记为 `CONFIRMED`，导致存储与历史统计虚假成功。 | 彻底解耦 `_finish_question`：主观/跳过题在 storage 中记录为 `STAGE_SKIPPED`（`submission_confirmed=0`），提交超时未决记录为 `STAGE_UNKNOWN`，绝不覆写为 `CONFIRMED`。在内存中标记为 completed 避免重复发题。 |
+| **P2-1** | `src/ai/strategy.py` | AI 超过单调截止期（deadline）后返回的慢答案仍被 strategy 接受为有效结果，可能引发作答超时违规。 | 在 `fast_single`、`race_first_valid` 和 `consensus` 中全面引入 `time.monotonic()` 严格截止期检查，超期返回的结果一律标记为已弃用并丢弃。 |
+| **P2-2** | `src/worker.py` | `--login` 和 `--import-session` 在空数据目录下因读取不存在的 `config.json` 崩溃；坏会话导致死循环启动浏览器。 | 1. 配置加载失败时自动回退安全默认值（`DEFAULTS`），保证会话导入与登录可在空目录零配置直接执行；<br>2. 增加 `browser_state.json` 文件 `mtime` 监控，相同损坏会话不重复拉起浏览器空转 10 秒。 |
+| **P2-3** | `src/ai/service.py` | `extra_body` 参数直接硬编码思考禁用，锁定特定供应商参数，且与旧测试环境中的配置对象不兼容。 | 新增 `_resolve_extra_body` 方法，支持通过 `custom_ai_extra_body` 配置自定义参数；配置兼容字典、JSON 字符串及通用配置对象；默认保留推理速度优化，供应商完全解耦。 |
+| **P2-4** | `Dockerfile` | 基础镜像依赖未锁定的 `python:3.11-slim`，且构建中依赖 `|| true` 掩盖依赖缺失，易导致构建结果不确定。 | 锁定 Debian 版本为 `python:3.11-slim-bookworm`；移除 `|| true`；改用显式判断，支持宿主预缓存与在线安装无缝兼容。 |
+
+### 5.2 真实 Playwright Chromium 100 轮基准测量
+
+- **测试工具**：`tests/benchmark_real_browser.py`
+- **运行环境**：真实本地 Headless Chromium，真实 DOM 加载与交互，50ms AI 延时桩
+- **执行轮数**：100 轮连续评测，**成功率 100.0%**
+- **各阶段耗时分布**：
+  - 题目检测与就绪 (`detect_to_ready_ms`): 平均 0.0ms | P95 0.0ms
+  - 真实 Chromium 截图准备 (`ready_to_ai_start_ms`): 平均 95.5ms | P50 94.0ms | P95 109.0ms | P99 110.0ms | Max 110.0ms（SLA $\le 500\text{ms}$，**PASS**）
+  - AI 桩推理延迟 (`ai_duration_ms`): 平均 57.4ms | P95 63.0ms | Max 78.0ms
+  - 真实 DOM 选项查找与点击 (`ai_to_validated_ms`): 平均 47.6ms | P50 47.0ms | P95 62.0ms | P99 63.0ms | Max 63.0ms（SLA $\le 500\text{ms}$，**PASS**）
+  - 真实提交点击与按钮消失确认 (`clicked_to_confirmed_ms`): 平均 38.6ms | P50 32.0ms | P95 47.0ms | Max 47.0ms
+  - **端到端全链路耗时** (`total_end_to_end_ms`): 平均 248.4ms | P50 250.0ms | P95 250.0ms | P99 266.0ms | Max 266.0ms
+
+### 5.3 测试验收证据
+
+- 回归测试集：`tests/test_review_regressions.py` 覆盖 6 大审查问题，**6/6 PASS**。
+- 全量自动化测试：`python -m unittest discover -s tests -p "test_*.py"`，**174/174 PASS（Ran 174 tests in 3.007s - OK）**。
+- 独立诊断探针：`review_20260928_probes.py`，全部 6 项断言核验通过。
+
+---
+
+## 6. 第七阶段就绪清单 (Stage 7 Entry Readiness Checklist)
+
+- [x] **缺陷闭环**：审查报告识别出的所有 P1/P2 缺陷已全部修复，回归测试与全量测试 100% 绿灯。
+- [x] **真实浏览器验收**：Playwright Chromium 100 轮连续基准测试通过，元素操作与截图时延真实达标。
+- [x] **文档对齐**：性能报告与 NAS 部署文档已更新至最新真实数据，移除过时配置。
+- [x] **NAS 运行安全**：远端生产容器运行正常且不受本地阶段开发影响。
+- [x] **阶段 7 规划就绪**：
+  - 模仿 `hdu-grabber` 暗黑风格界面（主色调 `#0f1419`）
+  - Caddy 统一网关：HTTPS `:40010`，`basic_auth`（用户名 `LzK`，密码 `LzK`）
+  - 后端轻量 API：状态机监控、日志推流、配置修改、会话导入与远程重启
+
